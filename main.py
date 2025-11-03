@@ -2,75 +2,68 @@ import os
 import sys
 import json
 import time
-import datetime
-import requests
 import psycopg2
-from psycopg2.extras import Json
-from collections import defaultdict
+import random
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, abort
+from collections import defaultdict
+import requests
+
+# LINE SDK
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, TextMessage
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-# === Flask設定 ===
+# Flaskアプリ初期化
 app = Flask(__name__)
 
-# === 環境変数 ===
+# 環境変数
 DATABASE_URL = os.getenv("DATABASE_URL")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CRON_TOKEN = os.getenv("CRON_TOKEN")
 
-if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI_API_KEY, CRON_TOKEN]):
+if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET]):
     print("❌ 環境変数が不足しています。Renderの設定を確認してください。")
     sys.exit(1)
 
+# LINE設定
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 
-# === データベース初期化 ===
-def init_db():
-    conn = psycopg2.connect(DATABASE_URL)
-    with conn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_data (
-            user_id VARCHAR(255) PRIMARY KEY,
-            history JSONB,
-            last_updated TIMESTAMPTZ
-        );
-        """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# === カケル人格設定 ===
-KAKERU_SYSTEM = """
-あなたの名前は「カケル」。男性向け恋愛カウンセラー兼親友AIです。
-【ルール】
-- 一人称は「俺」。丁寧すぎず自然。
-- 相手を否定せず共感を重視。
-- 恋愛話が中心。性的・暴力的・個人情報系の話題は禁止。
-- 医療や法律相談には専門家を案内。
-- 返信は800文字以内、最後に「今日の恋愛運」を一言。
-"""
-
-# === スパム防止 ===
-last_hit = defaultdict(float)
-def rate_limited(uid, interval=2.0):
+# レート制限
+last_hit = defaultdict(lambda: 0)
+def rate_limited(uid, interval=3):
     now = time.time()
     if now - last_hit[uid] < interval:
         return True
     last_hit[uid] = now
     return False
 
-# === LINE Webhook受信 ===
-@app.route("/callback", methods=['POST'])
+# 安全返信
+def safe_reply(token, text):
+    try:
+        with ApiClient(configuration) as api_client:
+            line_api = MessagingApi(api_client)
+            line_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=token,
+                    messages=[TextMessage(text=text)]
+                )
+            )
+    except Exception as e:
+        print(f"[LINE送信エラー] {e}")
+
+# --- Webhook受信 ---
+@app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
@@ -80,6 +73,18 @@ def callback():
         abort(400)
     return "OK"
 
+# === 恋愛おみくじ ===
+def get_love_fortune():
+    fortunes = [
+        "💘 大吉：運命の出会いが訪れるかも！積極的に行動してみよう！",
+        "💖 中吉：笑顔が恋を引き寄せる日。素直な気持ちを伝えてみて！",
+        "💞 小吉：焦らず一歩ずつ。相手のペースを大切にしてね。",
+        "💔 凶：今日は自分を癒す日。無理せずリラックスしよう。",
+        "💗 吉：連絡するなら夜がチャンス！自然体が一番魅力的。"
+    ]
+    return random.choice(fortunes)
+
+# === 会話メイン ===
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id
@@ -91,103 +96,125 @@ def handle_message(event):
         safe_reply(event.reply_token, "メッセージは1文字以上800文字以内で送ってね！")
         return
 
+    # --- DB接続 ---
     conn = psycopg2.connect(DATABASE_URL)
     with conn.cursor() as cur:
-        if text in ("/clear", "履歴リセット"):
-            cur.execute("DELETE FROM user_data WHERE user_id = %s;", (user_id,))
-            conn.commit()
-            conn.close()
-            safe_reply(event.reply_token, "OK！会話の記憶をリセットしたよ。")
-            return
-
-        if is_flagged(text):
-            conn.close()
-            safe_reply(event.reply_token, "ごめん、安全のためその話題には答えられないんだ。")
-            return
-
-        cur.execute("SELECT history, last_updated FROM user_data WHERE user_id = %s;", (user_id,))
-        result = cur.fetchone()
-        history = []
-        if result:
-            if datetime.datetime.now(datetime.timezone.utc) - result[1] < datetime.timedelta(days=7):
-                history = result[0]
-
-        history.append({"role": "user", "content": text})
-        messages = [{"role": "system", "content": KAKERU_SYSTEM}] + history[-10:]
-        reply_text = get_gpt_reply(messages)
-        history.append({"role": "assistant", "content": reply_text})
-
+        # ユーザーデータ保存テーブル
         cur.execute("""
-            INSERT INTO user_data (user_id, history, last_updated)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET
-                history = EXCLUDED.history,
-                last_updated = EXCLUDED.last_updated;
-        """, (user_id, Json(history), datetime.datetime.now(datetime.timezone.utc)))
+            CREATE TABLE IF NOT EXISTS user_data (
+                user_id TEXT PRIMARY KEY,
+                talk_count INTEGER DEFAULT 0,
+                last_talk TIMESTAMP
+            );
+        """)
+        # 会話履歴テーブル
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                user_id TEXT,
+                message TEXT,
+                timestamp TIMESTAMP
+            );
+        """)
+        # 話した回数
+        cur.execute("SELECT talk_count FROM user_data WHERE user_id=%s;", (user_id,))
+        result = cur.fetchone()
+        if result:
+            talk_count = result[0] + 1
+            cur.execute(
+                "UPDATE user_data SET talk_count=%s, last_talk=%s WHERE user_id=%s;",
+                (talk_count, datetime.now(timezone.utc), user_id)
+            )
+        else:
+            talk_count = 1
+            cur.execute(
+                "INSERT INTO user_data (user_id, talk_count, last_talk) VALUES (%s,%s,%s);",
+                (user_id, talk_count, datetime.now(timezone.utc))
+            )
+
+        # 今回のメッセージを保存
+        cur.execute(
+            "INSERT INTO chat_history (user_id, message, timestamp) VALUES (%s, %s, %s);",
+            (user_id, text, datetime.now(timezone.utc))
+        )
+        # 最新3件だけ残す
+        cur.execute("""
+            DELETE FROM chat_history
+            WHERE user_id=%s AND timestamp NOT IN (
+                SELECT timestamp FROM chat_history
+                WHERE user_id=%s ORDER BY timestamp DESC LIMIT 3
+            );
+        """, (user_id, user_id))
+
         conn.commit()
     conn.close()
+
+    # 会話レベル
+    if talk_count <= 3:
+        level = 1
+    elif talk_count <= 10:
+        level = 2
+    else:
+        level = 3
+
+    # 時間帯
+    hour = datetime.now(timezone(timedelta(hours=9))).hour
+    if hour < 10:
+        greet = "おはようございます☀️"
+    elif hour < 18:
+        greet = "こんにちは🌸"
+    else:
+        greet = "こんばんは🌙"
+
+    # おみくじ
+    if "おみくじ" in text or "占い" in text:
+        reply_text = f"{greet}\n今日の恋愛運は…\n\n{get_love_fortune()}"
+        safe_reply(event.reply_token, reply_text)
+        return
+
+    # --- 過去の話を思い出す ---
+    conn = psycopg2.connect(DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT message FROM chat_history WHERE user_id=%s ORDER BY timestamp DESC LIMIT 2;", (user_id,))
+        past = [r[0] for r in cur.fetchall()]
+    conn.close()
+
+    recall_text = ""
+    if talk_count > 5 and past:
+        last_topic = past[-1]
+        recall_text = f"そういえば前に『{last_topic[:20]}…』って話してましたね。その後どうなりましたか？\n\n"
+
+    # --- レベル別応答 ---
+    if level == 1:
+        reply_text = f"{greet}\nはじめまして。メッセージありがとうございます。\n恋愛や人間関係のこと、どんなことでも話してみてくださいね。"
+    elif level == 2:
+        reply_text = f"{recall_text}なるほど…。少し気持ちが整理できたかもしれませんね。もう少し詳しく話してもらえますか？"
+    else:
+        reply_text = f"{recall_text}そっかぁ。気になるねぇ😌　俺でよければもう少し聞かせて？"
+
     safe_reply(event.reply_token, reply_text)
 
-# === OpenAI呼び出し ===
-def get_gpt_reply(messages):
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.8},
-            timeout=20
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"[GPT error] {e}")
-        return "ごめん、今ちょっと混線してるみたい。もう一度話してみて！"
+# --- Render確認 ---
+@app.route("/")
+def home():
+    return "KakeruBot is running 🚀"
 
-# === モデレーション ===
-def is_flagged(text):
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/moderations",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "omni-moderation-latest", "input": text},
-            timeout=10
-        )
-        r.raise_for_status()
-        return r.json()["results"][0]["flagged"]
-    except:
-        return False
-
-# === 安全返信 ===
-def safe_reply(reply_token, text):
-    try:
-        with ApiClient(configuration) as api_client:
-            line_bot = MessagingApi(api_client)
-            line_bot.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(text=text)]
-                )
-            )
-    except Exception as e:
-        print(f"[LINE送信エラー] {e}")
-
-# === 占い（Render Cron対応） ===
-@app.route("/cron/daily-uranai", methods=["POST"])
+# --- おみくじ自動配信（Cron対応） ---
+@app.route("/cron/daily-uraniai", methods=["POST"])
 def cron_daily():
     if request.headers.get("X-Cron-Token") != CRON_TOKEN:
         abort(401)
 
     conn = psycopg2.connect(DATABASE_URL)
     with conn.cursor() as cur:
-        cur.execute("SELECT user_id FROM user_data;")
+        cur.execute("SELECT DISTINCT user_id FROM user_data;")
         users = cur.fetchall()
     conn.close()
 
     if not users:
-        return "OK"
+        return "No users"
 
-    fortune = get_daily_fortune()
-    push_message = f"🌅今日の恋愛運🌅\n{fortune}"
+    fortune = get_love_fortune()
+    push_message = f"🌅おはようございます！\n今日の恋愛運は…\n\n{fortune}"
 
     for user in users:
         user_id = user[0]
@@ -196,31 +223,18 @@ def cron_daily():
                 "https://api.line.me/v2/bot/message/push",
                 headers={
                     "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
                 },
-                json={"to": user_id, "messages": [{"type": "text", "text": push_message}]},
-                timeout=5
+                json={
+                    "to": user_id,
+                    "messages": [{"type": "text", "text": push_message}],
+                },
             )
         except Exception as e:
-            print(f"Push failed for {user_id}: {e}")
+            print(f"[Cron送信エラー] {e}")
+
     return "OK"
 
-def get_daily_fortune():
-    prompt = "男性向けにポジティブな恋愛運を一言で占ってください。"
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.85},
-            timeout=15
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"[Fortune error] {e}")
-        return "今日は直感が冴えてる日。自然体でいこう！"
-
-# === Render起動設定 ===
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
