@@ -2,9 +2,8 @@ import os
 import sys
 import psycopg2
 from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler, WebhookParser
-from linebot.v3.messaging import MessagingApi, MessagingApiBlob, MessagingApiBlobResponse, MessagingApiPushMessage, MessagingApiReplyMessage, TextMessage
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3 import WebhookHandler
+from linebot.v3.messaging import MessagingApi, TextMessage
 from linebot.v3.models import ReplyMessageRequest
 from linebot.v3.http_client import ApiClient
 from openai import OpenAI
@@ -13,7 +12,7 @@ from datetime import datetime
 # === Flask設定 ===
 app = Flask(__name__)
 
-# === 環境変数 ===
+# === 環境変数読み込み ===
 DATABASE_URL = os.getenv("DATABASE_URL")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
@@ -23,14 +22,10 @@ if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI
     print("⚠️ 環境変数が不足しています。Renderの設定を確認してください。")
     sys.exit(1)
 
-# === OpenAIクライアント ===
+# === クライアント設定 ===
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# === LINEハンドラー ===
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-configuration = {
-    "access_token": LINE_CHANNEL_ACCESS_TOKEN
-}
+configuration = {"access_token": LINE_CHANNEL_ACCESS_TOKEN}
 
 # === データベース初期化 ===
 def init_db():
@@ -58,10 +53,9 @@ def chat_with_gpt(user_input, history_text=""):
         messages = [
             {"role": "system", "content": (
                 "あなたの名前はカケル。男性向け恋愛カウンセラーAI。"
-                "会話は丁寧で落ち着いた口調。初対面では丁寧に。"
-                "慣れてきたら少しくだけた言葉や軽い冗談もOK。"
-                "相談者を否定せず共感を重視し、優しく返答。"
-                "専門的助言は一般的な内容のみにとどめる。"
+                "丁寧で落ち着いた口調で、相手を安心させる話し方を心がける。"
+                "初対面では丁寧に、慣れてきたら少しフランクで冗談も交える。"
+                "相談者を否定せず、共感を重視して寄り添う。"
                 "一度の返答は800文字以内。"
             )}
         ]
@@ -81,7 +75,7 @@ def chat_with_gpt(user_input, history_text=""):
 
     except Exception as e:
         print(f"[OpenAIエラー] {e}")
-        return "少し通信が不安定みたいです。もう一度話しかけてみてください。"
+        return "通信が少し不安定みたいです。もう一度話しかけてみてください。"
 
 # === LINE返信関数 ===
 def safe_reply(reply_token, message):
@@ -109,8 +103,8 @@ def callback():
         abort(400)
     return "OK"
 
-# === メッセージ受信処理 ===
-@handler.add(MessageEvent, message=TextMessageContent)
+# === メッセージ処理 ===
+@handler.add("message", message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     user_input = event.message.text.strip()
@@ -140,7 +134,7 @@ def handle_message(event):
 
     safe_reply(event.reply_token, reply_text)
 
-# === 手動リセット ===
+# === DBリセット機能 ===
 @app.route("/reset-db")
 def reset_db():
     conn = psycopg2.connect(DATABASE_URL)
