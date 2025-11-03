@@ -1,9 +1,11 @@
 import os
 import sys
+import time
 import psycopg2
+from psycopg2 import OperationalError
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEvent
 from openai import OpenAI
 
 # === Flask設定 ===
@@ -19,14 +21,28 @@ if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI
     print("⚠️ 環境変数が不足しています。Renderの設定を確認してください。")
     sys.exit(1)
 
-# === 各API初期化 ===
+# === API初期化 ===
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY)  # ✅ 修正済み: proxiesパラメータ削除
 
-# === データベース初期化 ===
+# === データベース接続（自動リトライ付き） ===
+def connect_db(retry=3, wait=3):
+    for i in range(retry):
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            return conn
+        except OperationalError as e:
+            print(f"[DB接続失敗] リトライ {i+1}/{retry} 回: {e}")
+            time.sleep(wait)
+    print("⚠️ DB接続に失敗しました。")
+    return None
+
+# === DB初期化 ===
 def init_db():
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = connect_db()
+    if not conn:
+        return
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_data (
@@ -45,14 +61,13 @@ init_db()
 def chat_with_gpt(user_input, history_text=""):
     if history_text is None:
         history_text = ""
-
     try:
         messages = [
             {"role": "system", "content": (
                 "あなたの名前はカケル。男性向け恋愛カウンセラーAI。"
-                "優しく落ち着いた口調で相手の悩みを受け止め、共感を重視する。"
-                "初対面では丁寧に、慣れたらフランクでもOK。"
-                "専門的な診断・法的助言は避け、一般的なアドバイスを中心に。"
+                "話し方は落ち着いていて優しい。相手に共感し、寄り添うように答える。"
+                "初対面では丁寧に、慣れたら少し親しみを出してもOK。"
+                "医学や法的助言は避け、一般的なアドバイスのみ。"
                 "一度の返答は800文字以内。"
             )}
         ]
@@ -71,16 +86,42 @@ def chat_with_gpt(user_input, history_text=""):
 
     except Exception as e:
         print(f"[OpenAIエラー] {e}")
-        return "少し通信が不安定みたいです。また話しかけてくださいね。"
+        return "ごめん、少し通信が不安定みたい💦 もう一度話しかけてくれる？"
 
-# === LINE返信関数 ===
+# === 安全にデータを保存 ===
+def save_user_data(user_id, user_input, reply_text, history_text, talk_count):
+    new_history = (history_text or "") + f"\n[ユーザー] {user_input}\n[カケル] {reply_text}"
+    new_history_lines = new_history.splitlines()[-20:]
+    new_history = "\n".join(new_history_lines)
+
+    conn = connect_db()
+    if not conn:
+        print("[DB保存スキップ] 接続失敗のため履歴を保存できませんでした。")
+        return
+
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO user_data (user_id, history, talk_count, last_updated)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (user_id)
+            DO UPDATE SET history=%s, talk_count=user_data.talk_count+1, last_updated=NOW();
+        """, (user_id, new_history, talk_count + 1, new_history))
+        conn.commit()
+    except Exception as e:
+        print(f"[DB保存エラー] {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+# === LINE返信 ===
 def safe_reply(reply_token, message):
     try:
         line_bot_api.reply_message(reply_token, TextSendMessage(text=message))
     except Exception as e:
         print(f"[LINE送信エラー] {e}")
 
-# === Webhookエンドポイント ===
+# === Webhook ===
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature")
@@ -92,55 +133,39 @@ def callback():
         abort(400)
     return "OK"
 
-# === メッセージ受信処理 ===
+# === 友達追加時のあいさつ ===
+@handler.add(FollowEvent)
+def handle_follow(event):
+    welcome_text = (
+        "🌙こんばんは！カケルです。\n\n"
+        "男性のための恋愛相談AIとして、あなたの悩みに寄り添います。\n"
+        "話しかけるだけでOKですよ。どんな内容でも気軽に話してください😊"
+    )
+    safe_reply(event.reply_token, welcome_text)
+
+# === メッセージ受信時 ===
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     user_input = event.message.text.strip()
 
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = connect_db()
+    if not conn:
+        safe_reply(event.reply_token, "今少しサーバーが眠っていたみたい💤 もう一度試してみて！")
+        return
+
     cur = conn.cursor()
     cur.execute("SELECT history, talk_count FROM user_data WHERE user_id=%s;", (user_id,))
     row = cur.fetchone()
-
     if row:
         history_text, talk_count = row
     else:
         history_text, talk_count = ("", 0)
 
     reply_text = chat_with_gpt(user_input, history_text)
-
-    new_history = (history_text or "") + f"\n[ユーザー] {user_input}\n[カケル] {reply_text}"
-    cur.execute("""
-        INSERT INTO user_data (user_id, history, talk_count, last_updated)
-        VALUES (%s, %s, %s, NOW())
-        ON CONFLICT (user_id)
-        DO UPDATE SET history=%s, talk_count=user_data.talk_count+1, last_updated=NOW();
-    """, (user_id, new_history, talk_count + 1, new_history))
-
-    conn.commit()
-    conn.close()
-
+    save_user_data(user_id, user_input, reply_text, history_text, talk_count)
     safe_reply(event.reply_token, reply_text)
 
-# === DBリセット ===
-@app.route("/reset-db")
-def reset_db():
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("DROP TABLE IF EXISTS user_data;")
-    cur.execute("""
-        CREATE TABLE user_data (
-            user_id TEXT PRIMARY KEY,
-            talk_count INTEGER DEFAULT 0,
-            history TEXT,
-            last_updated TIMESTAMP DEFAULT NOW()
-        );
-    """)
-    conn.commit()
-    conn.close()
-    return "✅ データベースをリセットしました！"
-
-# === アプリ起動 ===
+# === 起動 ===
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
