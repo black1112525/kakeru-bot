@@ -463,23 +463,3 @@ def cron_daily():
 # ====== 起動 ======
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=RENDER_PORT)
-
-# === 手動でDBリセットしたい時に使う ===
-@app.route("/reset-db")
-def reset_db():
-    import psycopg2
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("DROP TABLE IF EXISTS user_data;")
-    cur.execute("""
-        CREATE TABLE user_data (
-            user_id TEXT PRIMARY KEY,
-            talk_count INTEGER DEFAULT 0,
-            last_talk TIMESTAMP,
-            history TEXT,
-            last_updated TIMESTAMP
-        );
-    """)
-    conn.commit()
-    conn.close()
-    return "✅ データベースをリセットしました！"
