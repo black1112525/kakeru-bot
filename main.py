@@ -7,12 +7,11 @@ from linebot.v3.messaging import MessagingApi, TextMessage
 from linebot.v3.models import ReplyMessageRequest
 from linebot.v3.http_client import ApiClient
 from openai import OpenAI
-from datetime import datetime
 
 # === Flask設定 ===
 app = Flask(__name__)
 
-# === 環境変数読み込み ===
+# === 環境変数 ===
 DATABASE_URL = os.getenv("DATABASE_URL")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
@@ -22,12 +21,12 @@ if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI
     print("⚠️ 環境変数が不足しています。Renderの設定を確認してください。")
     sys.exit(1)
 
-# === クライアント設定 ===
+# === 初期設定 ===
 client = OpenAI(api_key=OPENAI_API_KEY)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 configuration = {"access_token": LINE_CHANNEL_ACCESS_TOKEN}
 
-# === データベース初期化 ===
+# === DB初期化 ===
 def init_db():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -53,15 +52,17 @@ def chat_with_gpt(user_input, history_text=""):
         messages = [
             {"role": "system", "content": (
                 "あなたの名前はカケル。男性向け恋愛カウンセラーAI。"
-                "丁寧で落ち着いた口調で、相手を安心させる話し方を心がける。"
-                "初対面では丁寧に、慣れてきたら少しフランクで冗談も交える。"
-                "相談者を否定せず、共感を重視して寄り添う。"
+                "優しく落ち着いた口調で、相手の悩みを受け止める。"
+                "初対面では丁寧に、慣れてきたら少しフランクに接して良い。"
+                "相談者を否定せず共感を重視。アドバイスは前向きに。"
+                "専門的な診断や法律的助言は行わず、一般的なサポートを提供する。"
                 "一度の返答は800文字以内。"
             )}
         ]
 
         if history_text:
             messages.append({"role": "assistant", "content": f"前回までの会話履歴: {history_text}"})
+
         messages.append({"role": "user", "content": user_input})
 
         response = client.chat.completions.create(
@@ -75,7 +76,7 @@ def chat_with_gpt(user_input, history_text=""):
 
     except Exception as e:
         print(f"[OpenAIエラー] {e}")
-        return "通信が少し不安定みたいです。もう一度話しかけてみてください。"
+        return "通信が少し不安定みたいです。もう一度話しかけてください。"
 
 # === LINE返信関数 ===
 def safe_reply(reply_token, message):
@@ -91,11 +92,12 @@ def safe_reply(reply_token, message):
     except Exception as e:
         print(f"[LINE送信エラー] {e}")
 
-# === LINE Webhook ===
-@app.route("/callback", methods=['POST'])
+# === Webhook設定 ===
+@app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
     except Exception as e:
@@ -134,7 +136,7 @@ def handle_message(event):
 
     safe_reply(event.reply_token, reply_text)
 
-# === DBリセット機能 ===
+# === DBリセット（必要な時のみ使用） ===
 @app.route("/reset-db")
 def reset_db():
     conn = psycopg2.connect(DATABASE_URL)
@@ -152,6 +154,6 @@ def reset_db():
     conn.close()
     return "✅ データベースをリセットしました！"
 
-# === 起動 ===
+# === アプリ起動 ===
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
