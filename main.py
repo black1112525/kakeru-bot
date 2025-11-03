@@ -53,6 +53,9 @@ init_db()
 
 # === GPT応答関数（優しく丁寧な人格設定）===
 def chat_with_gpt(user_input, history_text=""):
+   if history_text is None:
+    history_text = ""
+
     try:
         messages = [
             {"role": "system", "content": (
