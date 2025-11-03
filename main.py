@@ -1,12 +1,13 @@
 import os
 import sys
 import time
+from contextlib import contextmanager
 import psycopg2
 from psycopg2 import OperationalError
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEvent
-from openai import OpenAI
+from openai import OpenAI  # ✅ 新バージョン対応
 
 # === Flask設定 ===
 app = Flask(__name__)
@@ -16,6 +17,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ADMIN_ID = os.getenv("ADMIN_ID")  # 任意設定：通知先LINE ID
 
 if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI_API_KEY]):
     print("⚠️ 環境変数が不足しています。Renderの設定を確認してください。")
@@ -24,102 +26,119 @@ if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI
 # === API初期化 ===
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-client = OpenAI(api_key=OPENAI_API_KEY)  # ✅ 修正済み: proxiesパラメータ削除
+client = OpenAI(api_key=OPENAI_API_KEY)  # ✅ proxiesを内部で処理する新構文
 
-# === データベース接続（自動リトライ付き） ===
+# === DB接続（リトライ付き） ===
 def connect_db(retry=3, wait=3):
     for i in range(retry):
         try:
-            conn = psycopg2.connect(DATABASE_URL)
-            return conn
+            return psycopg2.connect(DATABASE_URL)
         except OperationalError as e:
-            print(f"[DB接続失敗] リトライ {i+1}/{retry} 回: {e}")
+            print(f"[DB接続失敗] リトライ {i+1}/{retry}: {e}")
             time.sleep(wait)
     print("⚠️ DB接続に失敗しました。")
     return None
 
-# === DB初期化 ===
-def init_db():
+# === DBコンテキスト ===
+@contextmanager
+def get_db():
     conn = connect_db()
     if not conn:
+        yield None
         return
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_data (
-            user_id TEXT PRIMARY KEY,
-            talk_count INTEGER DEFAULT 0,
-            history TEXT,
-            last_updated TIMESTAMP DEFAULT NOW()
-        );
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# === DB初期化 ===
+def init_db():
+    with get_db() as conn:
+        if not conn:
+            return
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_data (
+                user_id TEXT PRIMARY KEY,
+                talk_count INTEGER DEFAULT 0,
+                history TEXT,
+                last_updated TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        conn.commit()
 
 init_db()
 
+# === 管理者通知 ===
+def notify_admin(message):
+    if not ADMIN_ID:
+        return
+    try:
+        line_bot_api.push_message(ADMIN_ID, TextSendMessage(text=f"[⚠️Bot通知]\n{message}"))
+    except Exception as e:
+        print(f"[通知エラー] {e}")
+
 # === GPT応答関数 ===
-def chat_with_gpt(user_input, history_text=""):
+def chat_with_gpt(user_input, history_text="", retry=2):
     if history_text is None:
         history_text = ""
-    try:
-        messages = [
-            {"role": "system", "content": (
-                "あなたの名前はカケル。男性向け恋愛カウンセラーAI。"
-                "話し方は落ち着いていて優しい。相手に共感し、寄り添うように答える。"
-                "初対面では丁寧に、慣れたら少し親しみを出してもOK。"
-                "医学や法的助言は避け、一般的なアドバイスのみ。"
-                "一度の返答は800文字以内。"
-            )}
-        ]
-        if history_text:
-            messages.append({"role": "assistant", "content": f"前回までの会話履歴: {history_text}"})
-        messages.append({"role": "user", "content": user_input})
 
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            temperature=0.8,
-            timeout=40
-        )
+    for attempt in range(retry):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": (
+                        "あなたの名前はカケル。男性向け恋愛カウンセラーAI。"
+                        "落ち着いた優しい口調で共感を重視する。"
+                        "医学・法律の専門的助言は行わない。"
+                        "一度の返答は800文字以内。"
+                    )},
+                    {"role": "user", "content": user_input}
+                ],
+                temperature=0.8,
+                timeout=40
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[OpenAI通信失敗 {attempt+1}/{retry}] {e}")
+            time.sleep(2)
 
-        return response.choices[0].message.content.strip()
+    notify_admin("OpenAI通信に失敗しました。")
+    return "すみません💦 今は少し混み合ってるみたい。少ししてから話しかけてください。"
 
-    except Exception as e:
-        print(f"[OpenAIエラー] {e}")
-        return "ごめん、少し通信が不安定みたい💦 もう一度話しかけてくれる？"
-
-# === 安全にデータを保存 ===
+# === 履歴保存 ===
 def save_user_data(user_id, user_input, reply_text, history_text, talk_count):
     new_history = (history_text or "") + f"\n[ユーザー] {user_input}\n[カケル] {reply_text}"
-    new_history_lines = new_history.splitlines()[-20:]
-    new_history = "\n".join(new_history_lines)
+    new_history = "\n".join(new_history.splitlines()[-20:])  # 最新20行まで保存
 
-    conn = connect_db()
-    if not conn:
-        print("[DB保存スキップ] 接続失敗のため履歴を保存できませんでした。")
-        return
+    with get_db() as conn:
+        if not conn:
+            print("[DB保存スキップ] 接続失敗のため履歴を保存できませんでした。")
+            return
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO user_data (user_id, history, talk_count, last_updated)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (user_id)
+                DO UPDATE SET history=%s, talk_count=user_data.talk_count+1, last_updated=NOW();
+            """, (user_id, new_history, talk_count + 1, new_history))
+            conn.commit()
+        except Exception as e:
+            print(f"[DB保存エラー] {e}")
+            notify_admin(f"DB保存エラー: {e}")
 
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO user_data (user_id, history, talk_count, last_updated)
-            VALUES (%s, %s, %s, NOW())
-            ON CONFLICT (user_id)
-            DO UPDATE SET history=%s, talk_count=user_data.talk_count+1, last_updated=NOW();
-        """, (user_id, new_history, talk_count + 1, new_history))
-        conn.commit()
-    except Exception as e:
-        print(f"[DB保存エラー] {e}")
-    finally:
-        cur.close()
-        conn.close()
-
-# === LINE返信 ===
-def safe_reply(reply_token, message):
-    try:
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=message))
-    except Exception as e:
-        print(f"[LINE送信エラー] {e}")
+# === 安全な返信 ===
+def safe_reply(reply_token, message, retry=2):
+    for i in range(retry):
+        try:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=message))
+            return
+        except Exception as e:
+            print(f"[LINE送信エラー {i+1}/{retry}] {e}")
+            time.sleep(1)
+    notify_admin("LINE送信エラーが発生しました。")
 
 # === Webhook ===
 @app.route("/callback", methods=["POST"])
@@ -130,16 +149,17 @@ def callback():
         handler.handle(body, signature)
     except Exception as e:
         print(f"[Webhookエラー] {e}")
+        notify_admin(f"Webhookエラー: {e}")
         abort(400)
     return "OK"
 
-# === 友達追加時のあいさつ ===
+# === 友達追加時 ===
 @handler.add(FollowEvent)
 def handle_follow(event):
     welcome_text = (
-        "🌙こんばんは！カケルです。\n\n"
-        "男性のための恋愛相談AIとして、あなたの悩みに寄り添います。\n"
-        "話しかけるだけでOKですよ。どんな内容でも気軽に話してください😊"
+        "🌙 こんばんは！カケルです。\n\n"
+        "男性のための恋愛相談AIとして、あなたの話をじっくり聞きます。\n"
+        "どんな内容でも気軽に話しかけてくださいね😊"
     )
     safe_reply(event.reply_token, welcome_text)
 
@@ -149,22 +169,24 @@ def handle_message(event):
     user_id = event.source.user_id
     user_input = event.message.text.strip()
 
-    conn = connect_db()
-    if not conn:
-        safe_reply(event.reply_token, "今少しサーバーが眠っていたみたい💤 もう一度試してみて！")
-        return
+    with get_db() as conn:
+        if not conn:
+            safe_reply(event.reply_token, "今少しサーバーが眠ってたみたい💤 もう一度話しかけてみて！")
+            return
 
-    cur = conn.cursor()
-    cur.execute("SELECT history, talk_count FROM user_data WHERE user_id=%s;", (user_id,))
-    row = cur.fetchone()
-    if row:
-        history_text, talk_count = row
-    else:
-        history_text, talk_count = ("", 0)
+        cur = conn.cursor()
+        cur.execute("SELECT history, talk_count FROM user_data WHERE user_id=%s;", (user_id,))
+        row = cur.fetchone()
+        history_text, talk_count = (row if row else ("", 0))
 
     reply_text = chat_with_gpt(user_input, history_text)
     save_user_data(user_id, user_input, reply_text, history_text, talk_count)
     safe_reply(event.reply_token, reply_text)
+
+# === Renderヘルスチェック ===
+@app.route("/health")
+def health():
+    return "OK", 200
 
 # === 起動 ===
 if __name__ == "__main__":
