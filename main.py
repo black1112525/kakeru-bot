@@ -3,8 +3,7 @@ import sys
 import psycopg2
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
-from linebot.v3.messaging import MessagingApi, TextMessage
-from linebot.v3.models import ReplyMessageRequest
+from linebot.v3.messaging import MessagingApi, TextMessage, ReplyMessageRequest
 from linebot.v3.http_client import ApiClient
 from openai import OpenAI
 
@@ -76,19 +75,18 @@ def chat_with_gpt(user_input, history_text=""):
 
     except Exception as e:
         print(f"[OpenAIエラー] {e}")
-        return "通信が少し不安定みたいです。もう一度話しかけてください。"
+        return "通信が不安定のようです。もう一度話しかけてみてください。"
 
 # === LINE返信関数 ===
 def safe_reply(reply_token, message):
     try:
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(text=message)]
-                )
+            req = ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=message)]
             )
+            line_bot_api.reply_message(req)
     except Exception as e:
         print(f"[LINE送信エラー] {e}")
 
@@ -136,7 +134,7 @@ def handle_message(event):
 
     safe_reply(event.reply_token, reply_text)
 
-# === DBリセット（必要な時のみ使用） ===
+# === DBリセット ===
 @app.route("/reset-db")
 def reset_db():
     conn = psycopg2.connect(DATABASE_URL)
@@ -154,6 +152,6 @@ def reset_db():
     conn.close()
     return "✅ データベースをリセットしました！"
 
-# === アプリ起動 ===
+# === 起動 ===
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
