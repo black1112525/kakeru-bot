@@ -2,8 +2,8 @@ import os
 import sys
 import psycopg2
 from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler, ApiClient
-from linebot.v3.messaging import MessagingApi, TextMessage, ReplyMessageRequest
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from openai import OpenAI
 
 # === Flask設定 ===
@@ -19,12 +19,12 @@ if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI
     print("⚠️ 環境変数が不足しています。Renderの設定を確認してください。")
     sys.exit(1)
 
-# === 初期設定 ===
-client = OpenAI(api_key=OPENAI_API_KEY)
+# === 各API初期化 ===
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-configuration = {"access_token": LINE_CHANNEL_ACCESS_TOKEN}
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# === DB初期化 ===
+# === データベース初期化 ===
 def init_db():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -50,9 +50,9 @@ def chat_with_gpt(user_input, history_text=""):
         messages = [
             {"role": "system", "content": (
                 "あなたの名前はカケル。男性向け恋愛カウンセラーAI。"
-                "優しく落ち着いた口調で相手の話を受け止める。"
-                "初対面では丁寧に、慣れたら少しフランクでも良い。"
-                "相談者を否定せず共感を重視。"
+                "優しく落ち着いた口調で相手の悩みを受け止め、共感を重視する。"
+                "初対面では丁寧に、慣れたらフランクでもOK。"
+                "専門的な診断・法的助言は避け、一般的なアドバイスを中心に。"
                 "一度の返答は800文字以内。"
             )}
         ]
@@ -66,28 +66,24 @@ def chat_with_gpt(user_input, history_text=""):
             temperature=0.8,
             timeout=40
         )
+
         return response.choices[0].message.content.strip()
+
     except Exception as e:
         print(f"[OpenAIエラー] {e}")
-        return "今ちょっと通信が不安定みたいです。また話しかけてください。"
+        return "少し通信が不安定みたいです。また話しかけてくださいね。"
 
 # === LINE返信関数 ===
 def safe_reply(reply_token, message):
     try:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            req = ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=message)]
-            )
-            line_bot_api.reply_message(req)
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=message))
     except Exception as e:
         print(f"[LINE送信エラー] {e}")
 
-# === Webhook設定 ===
+# === Webhookエンドポイント ===
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature", "")
+    signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
@@ -96,8 +92,8 @@ def callback():
         abort(400)
     return "OK"
 
-# === メッセージ処理 ===
-@handler.add("message", message=TextMessage)
+# === メッセージ受信処理 ===
+@handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     user_input = event.message.text.strip()
@@ -145,6 +141,6 @@ def reset_db():
     conn.close()
     return "✅ データベースをリセットしました！"
 
-# === 起動 ===
+# === アプリ起動 ===
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
