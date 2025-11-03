@@ -105,6 +105,28 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return "OK"
+# ============================
+# 友達追加時のウェルカムメッセージ
+# ============================
+from linebot.v3.webhooks import FollowEvent
+
+@handler.add(FollowEvent)
+def handle_follow(event):
+    user_id = event.source.user_id
+    welcome_message = (
+        "🌸 こんにちは！カケルです！\n\n"
+        "追加してくれてありがとう😊\n"
+        "恋愛のこと、人間関係のこと、どんな悩みでも気軽に話してみてね。\n"
+        "俺がしっかりサポートするから！💪"
+    )
+
+    line_bot_api.push_message(
+        user_id,
+        {
+            "type": "text",
+            "text": welcome_message
+        }
+    )
 
 # === メッセージ受信処理 ===
 @handler.add(MessageEvent, message=TextMessageContent)
