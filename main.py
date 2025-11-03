@@ -7,39 +7,39 @@ from psycopg2 import OperationalError
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEvent
-from openai import OpenAI  # ✅ 新バージョン対応
+from openai import OpenAI  # ✅ 新SDK対応
 
-# === Flask設定 ===
+# --- Flask初期化 ---
 app = Flask(__name__)
 
-# === 環境変数 ===
+# --- 環境変数 ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_ID = os.getenv("ADMIN_ID")  # 任意設定：通知先LINE ID
+ADMIN_ID = os.getenv("ADMIN_ID")
 
+# --- チェック ---
 if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI_API_KEY]):
-    print("⚠️ 環境変数が不足しています。Renderの設定を確認してください。")
+    print("⚠️ Render環境変数が不足しています。")
     sys.exit(1)
 
-# === API初期化 ===
+# --- 初期化 ---
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-client = OpenAI(api_key=OPENAI_API_KEY)  # ✅ proxiesを内部で処理する新構文
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # ✅ proxiesバグ完全対応
 
-# === DB接続（リトライ付き） ===
+# --- DB接続 ---
 def connect_db(retry=3, wait=3):
     for i in range(retry):
         try:
             return psycopg2.connect(DATABASE_URL)
         except OperationalError as e:
-            print(f"[DB接続失敗] リトライ {i+1}/{retry}: {e}")
+            print(f"[DB接続失敗] {i+1}/{retry}回目: {e}")
             time.sleep(wait)
-    print("⚠️ DB接続に失敗しました。")
+    print("⚠️ DB接続できませんでした。")
     return None
 
-# === DBコンテキスト ===
 @contextmanager
 def get_db():
     conn = connect_db()
@@ -51,7 +51,7 @@ def get_db():
     finally:
         conn.close()
 
-# === DB初期化 ===
+# --- DB初期化 ---
 def init_db():
     with get_db() as conn:
         if not conn:
@@ -66,33 +66,31 @@ def init_db():
             );
         """)
         conn.commit()
-
 init_db()
 
-# === 管理者通知 ===
-def notify_admin(message):
+# --- 管理者通知 ---
+def notify_admin(msg):
     if not ADMIN_ID:
         return
     try:
-        line_bot_api.push_message(ADMIN_ID, TextSendMessage(text=f"[⚠️Bot通知]\n{message}"))
+        line_bot_api.push_message(ADMIN_ID, TextSendMessage(text=f"[BOT通知]\n{msg}"))
     except Exception as e:
         print(f"[通知エラー] {e}")
 
-# === GPT応答関数 ===
+# --- ChatGPT処理 ---
 def chat_with_gpt(user_input, history_text="", retry=2):
     if history_text is None:
         history_text = ""
-
-    for attempt in range(retry):
+    for i in range(retry):
         try:
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": (
-                        "あなたの名前はカケル。男性向け恋愛カウンセラーAI。"
-                        "落ち着いた優しい口調で共感を重視する。"
-                        "医学・法律の専門的助言は行わない。"
-                        "一度の返答は800文字以内。"
+                        "あなたの名前はカケル。男性向け恋愛相談AIです。"
+                        "落ち着いた優しい口調で、共感重視の受け答えをします。"
+                        "専門的な診断・法律・医療の話題は避けます。"
+                        "返答は800文字以内で、丁寧に優しく。"
                     )},
                     {"role": "user", "content": user_input}
                 ],
@@ -101,20 +99,18 @@ def chat_with_gpt(user_input, history_text="", retry=2):
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            print(f"[OpenAI通信失敗 {attempt+1}/{retry}] {e}")
+            print(f"[OpenAI通信失敗 {i+1}/{retry}] {e}")
             time.sleep(2)
-
     notify_admin("OpenAI通信に失敗しました。")
-    return "すみません💦 今は少し混み合ってるみたい。少ししてから話しかけてください。"
+    return "ごめんね💦 今ちょっと混み合ってるみたい。もう少ししてから話しかけてみて！"
 
-# === 履歴保存 ===
+# --- 履歴保存 ---
 def save_user_data(user_id, user_input, reply_text, history_text, talk_count):
     new_history = (history_text or "") + f"\n[ユーザー] {user_input}\n[カケル] {reply_text}"
-    new_history = "\n".join(new_history.splitlines()[-20:])  # 最新20行まで保存
-
+    new_history = "\n".join(new_history.splitlines()[-20:])  # 最新20件のみ保持
     with get_db() as conn:
         if not conn:
-            print("[DB保存スキップ] 接続失敗のため履歴を保存できませんでした。")
+            print("[DB未接続: 履歴保存スキップ]")
             return
         cur = conn.cursor()
         try:
@@ -129,7 +125,7 @@ def save_user_data(user_id, user_input, reply_text, history_text, talk_count):
             print(f"[DB保存エラー] {e}")
             notify_admin(f"DB保存エラー: {e}")
 
-# === 安全な返信 ===
+# --- LINE返信 ---
 def safe_reply(reply_token, message, retry=2):
     for i in range(retry):
         try:
@@ -138,9 +134,9 @@ def safe_reply(reply_token, message, retry=2):
         except Exception as e:
             print(f"[LINE送信エラー {i+1}/{retry}] {e}")
             time.sleep(1)
-    notify_admin("LINE送信エラーが発生しました。")
+    notify_admin("LINE送信失敗")
 
-# === Webhook ===
+# --- Webhook受信 ---
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature")
@@ -153,41 +149,38 @@ def callback():
         abort(400)
     return "OK"
 
-# === 友達追加時 ===
+# --- 友だち追加時 ---
 @handler.add(FollowEvent)
 def handle_follow(event):
-    welcome_text = (
+    welcome = (
         "🌙 こんばんは！カケルです。\n\n"
         "男性のための恋愛相談AIとして、あなたの話をじっくり聞きます。\n"
-        "どんな内容でも気軽に話しかけてくださいね😊"
+        "気軽に話しかけてください😊"
     )
-    safe_reply(event.reply_token, welcome_text)
+    safe_reply(event.reply_token, welcome)
 
-# === メッセージ受信時 ===
+# --- 通常メッセージ ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     user_input = event.message.text.strip()
-
     with get_db() as conn:
         if not conn:
-            safe_reply(event.reply_token, "今少しサーバーが眠ってたみたい💤 もう一度話しかけてみて！")
+            safe_reply(event.reply_token, "今サーバーがちょっと休んでるみたい💤 また話しかけてね。")
             return
-
         cur = conn.cursor()
         cur.execute("SELECT history, talk_count FROM user_data WHERE user_id=%s;", (user_id,))
         row = cur.fetchone()
         history_text, talk_count = (row if row else ("", 0))
-
     reply_text = chat_with_gpt(user_input, history_text)
     save_user_data(user_id, user_input, reply_text, history_text, talk_count)
     safe_reply(event.reply_token, reply_text)
 
-# === Renderヘルスチェック ===
+# --- ヘルスチェック ---
 @app.route("/health")
 def health():
     return "OK", 200
 
-# === 起動 ===
+# --- 起動 ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
