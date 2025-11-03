@@ -2,9 +2,8 @@ import os
 import sys
 import psycopg2
 from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler
+from linebot.v3 import WebhookHandler, ApiClient
 from linebot.v3.messaging import MessagingApi, TextMessage, ReplyMessageRequest
-from linebot.v3.http_client import ApiClient
 from openai import OpenAI
 
 # === Flask設定 ===
@@ -51,17 +50,14 @@ def chat_with_gpt(user_input, history_text=""):
         messages = [
             {"role": "system", "content": (
                 "あなたの名前はカケル。男性向け恋愛カウンセラーAI。"
-                "優しく落ち着いた口調で、相手の悩みを受け止める。"
-                "初対面では丁寧に、慣れてきたら少しフランクに接して良い。"
-                "相談者を否定せず共感を重視。アドバイスは前向きに。"
-                "専門的な診断や法律的助言は行わず、一般的なサポートを提供する。"
+                "優しく落ち着いた口調で相手の話を受け止める。"
+                "初対面では丁寧に、慣れたら少しフランクでも良い。"
+                "相談者を否定せず共感を重視。"
                 "一度の返答は800文字以内。"
             )}
         ]
-
         if history_text:
             messages.append({"role": "assistant", "content": f"前回までの会話履歴: {history_text}"})
-
         messages.append({"role": "user", "content": user_input})
 
         response = client.chat.completions.create(
@@ -70,12 +66,10 @@ def chat_with_gpt(user_input, history_text=""):
             temperature=0.8,
             timeout=40
         )
-
         return response.choices[0].message.content.strip()
-
     except Exception as e:
         print(f"[OpenAIエラー] {e}")
-        return "通信が不安定のようです。もう一度話しかけてみてください。"
+        return "今ちょっと通信が不安定みたいです。また話しかけてください。"
 
 # === LINE返信関数 ===
 def safe_reply(reply_token, message):
@@ -95,7 +89,6 @@ def safe_reply(reply_token, message):
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-
     try:
         handler.handle(body, signature)
     except Exception as e:
