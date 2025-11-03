@@ -1,20 +1,14 @@
 import os
 import sys
-import json
 import psycopg2
-from datetime import datetime, timezone
 from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage,
-)
+from linebot.v3 import WebhookHandler, WebhookParser
+from linebot.v3.messaging import MessagingApi, MessagingApiBlob, MessagingApiBlobResponse, MessagingApiPushMessage, MessagingApiReplyMessage, TextMessage
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
-import openai
+from linebot.v3.models import ReplyMessageRequest
+from linebot.v3.http_client import ApiClient
+from openai import OpenAI
+from datetime import datetime
 
 # === Flask設定 ===
 app = Flask(__name__)
@@ -26,12 +20,17 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not all([DATABASE_URL, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI_API_KEY]):
-    print("❌ 環境変数が不足しています。Renderの設定を確認してください。")
+    print("⚠️ 環境変数が不足しています。Renderの設定を確認してください。")
     sys.exit(1)
 
-openai.api_key = OPENAI_API_KEY
+# === OpenAIクライアント ===
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# === LINEハンドラー ===
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+configuration = {
+    "access_token": LINE_CHANNEL_ACCESS_TOKEN
+}
 
 # === データベース初期化 ===
 def init_db():
@@ -42,47 +41,47 @@ def init_db():
             user_id TEXT PRIMARY KEY,
             talk_count INTEGER DEFAULT 0,
             history TEXT,
-            last_updated TIMESTAMP
+            last_updated TIMESTAMP DEFAULT NOW()
         );
     """)
     conn.commit()
-    cur.close()
     conn.close()
 
 init_db()
 
-# === GPT応答関数（優しく丁寧な人格設定）===
+# === GPT応答関数 ===
 def chat_with_gpt(user_input, history_text=""):
-   if history_text is None:
-    history_text = ""
+    if history_text is None:
+        history_text = ""
 
     try:
         messages = [
             {"role": "system", "content": (
                 "あなたの名前はカケル。男性向け恋愛カウンセラーAI。"
-                "基本は丁寧で落ち着いた口調。初対面では丁寧に、"
-                "慣れてきたら少しくだけた言葉や軽い冗談も交えて良い。"
-                "相談者を否定せず共感を重視。アドバイスは前向きで優しく。"
-                "医療・法律などの専門相談は勧めず、一般的な助言のみ。"
-                "一度の返信は800文字以内。"
+                "会話は丁寧で落ち着いた口調。初対面では丁寧に。"
+                "慣れてきたら少しくだけた言葉や軽い冗談もOK。"
+                "相談者を否定せず共感を重視し、優しく返答。"
+                "専門的助言は一般的な内容のみにとどめる。"
+                "一度の返答は800文字以内。"
             )}
         ]
+
         if history_text:
             messages.append({"role": "assistant", "content": f"前回までの会話履歴: {history_text}"})
         messages.append({"role": "user", "content": user_input})
 
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=messages,
             temperature=0.8,
             timeout=40
         )
 
-        reply = response["choices"][0]["message"]["content"].strip()
-        return reply
+        return response.choices[0].message.content.strip()
+
     except Exception as e:
         print(f"[OpenAIエラー] {e}")
-        return "すみません💦　少し通信が不安定みたいです。もう一度話してもらえますか？"
+        return "少し通信が不安定みたいです。もう一度話しかけてみてください。"
 
 # === LINE返信関数 ===
 def safe_reply(reply_token, message):
@@ -105,71 +104,60 @@ def callback():
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
-    except InvalidSignatureError:
+    except Exception as e:
+        print(f"[Webhookエラー] {e}")
         abort(400)
     return "OK"
-# ============================
-# 友達追加時のウェルカムメッセージ
-# ============================
-from linebot.v3.webhooks import FollowEvent
-
-@handler.add(FollowEvent)
-def handle_follow(event):
-    user_id = event.source.user_id
-    welcome_message = (
-        "🌸 こんにちは！カケルです！\n\n"
-        "追加してくれてありがとう😊\n"
-        "恋愛のこと、人間関係のこと、どんな悩みでも気軽に話してみてね。\n"
-        "俺がしっかりサポートするから！💪"
-    )
-
-    line_bot_api.push_message(
-        user_id,
-        {
-            "type": "text",
-            "text": welcome_message
-        }
-    )
 
 # === メッセージ受信処理 ===
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id
-    text = event.message.text.strip()
+    user_input = event.message.text.strip()
 
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
-
-    # 履歴取得
-    cur.execute("SELECT history, talk_count FROM user_data WHERE user_id = %s;", (user_id,))
+    cur.execute("SELECT history, talk_count FROM user_data WHERE user_id=%s;", (user_id,))
     row = cur.fetchone()
-    history_text = row[0] if row else ""
-    talk_count = row[1] if row else 0
 
-    # GPT応答
-    reply = chat_with_gpt(text, history_text)
+    if row:
+        history_text, talk_count = row
+    else:
+        history_text, talk_count = ("", 0)
 
-    # 履歴更新
-    new_history = (history_text + "\n[ユーザー] " + text + "\n[カケル] " + reply).strip()
-    talk_count += 1
+    reply_text = chat_with_gpt(user_input, history_text)
 
+    new_history = (history_text or "") + f"\n[ユーザー] {user_input}\n[カケル] {reply_text}"
     cur.execute("""
-        INSERT INTO user_data (user_id, talk_count, history, last_updated)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO user_data (user_id, history, talk_count, last_updated)
+        VALUES (%s, %s, %s, NOW())
         ON CONFLICT (user_id)
-        DO UPDATE SET talk_count = %s, history = %s, last_updated = %s;
-    """, (
-        user_id, talk_count, new_history, datetime.now(timezone.utc),
-        talk_count, new_history, datetime.now(timezone.utc)
-    ))
+        DO UPDATE SET history=%s, talk_count=user_data.talk_count+1, last_updated=NOW();
+    """, (user_id, new_history, talk_count + 1, new_history))
 
     conn.commit()
-    cur.close()
     conn.close()
 
-    safe_reply(event.reply_token, reply)
+    safe_reply(event.reply_token, reply_text)
 
-# === Render起動設定 ===
+# === 手動リセット ===
+@app.route("/reset-db")
+def reset_db():
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute("DROP TABLE IF EXISTS user_data;")
+    cur.execute("""
+        CREATE TABLE user_data (
+            user_id TEXT PRIMARY KEY,
+            talk_count INTEGER DEFAULT 0,
+            history TEXT,
+            last_updated TIMESTAMP DEFAULT NOW()
+        );
+    """)
+    conn.commit()
+    conn.close()
+    return "✅ データベースをリセットしました！"
+
+# === 起動 ===
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
