@@ -8,7 +8,7 @@ from linebot.models import TextSendMessage
 # ======== 環境変数 ========
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-CRON_KEY = os.getenv("CRON_KEY", "secret123")  # Renderで設定
+CRON_KEY = os.getenv("CRON_KEY", "secret123")
 
 # ======== Flask初期化 ========
 app = Flask(__name__)
@@ -74,10 +74,10 @@ def build_daily_omikuji():
 
     positive_msgs = [
         "今日もきっといい日になるよ🌈",
-        "焦らず、自分らしくいこう☀️",
-        "小さな前進が大きな変化を作る💪",
-        "笑顔でいるだけで運気も上向き！😊",
-        "今日もあなたなら大丈夫。胸を張っていこう✨"
+        "無理せず、自分のペースでいこう☀️",
+        "笑顔でスタートしよう😊",
+        "焦らず、自分らしくいこう🌸",
+        "どんな日も前向きに、あなたらしく✨"
     ]
 
     love_rank = _weighted_choice(rnd, ranks)
@@ -85,8 +85,8 @@ def build_daily_omikuji():
     gamb_rank = _weighted_choice(rnd, ranks)
 
     msg = (
-        "☀️おはよう、今日のカケルのおみくじ🌈\n\n"
-        f"💘 恋愛運：{love_rank}\n{love_msgs[love_rank]}\n\n"
+        "🌅おはよう、今日のカケルのおみくじ🌈\n\n"
+        f"💖 恋愛運：{love_rank}\n{love_msgs[love_rank]}\n\n"
         f"💼 仕事運：{work_rank}\n{work_msgs[work_rank]}\n\n"
         f"🎲 ギャンブル運：{gamb_rank}\n{gamble_msgs[gamb_rank]}\n\n"
         f"🎯 ラッキーアクション：{rnd.choice(actions)}\n"
