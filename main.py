@@ -90,6 +90,12 @@ def index():
     return "✅ Kakeru Bot is running!"
 
 
+# ✅ Renderヘルスチェック対応（これが重要！）
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    return "OK", 200
+
+
 # ===== メイン起動 =====
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
