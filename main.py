@@ -207,3 +207,96 @@ def index():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+# ===== 定期配信用ルート =====
+from datetime import datetime
+import pytz
+
+@app.route("/cron/monday")
+def cron_monday():
+    key = request.args.get("key")
+    if key != os.getenv("CRON_KEY"):
+        return "Forbidden", 403
+
+    message = (
+        "🌅今週のテーマ🌅\n"
+        "新しい一歩を踏み出す週。迷うなら“やってみる”を選んでみよう！\n\n"
+        "焦らず、自分のペースで行こう💪\n"
+        "#カケル週間メッセージ"
+    )
+
+    send_broadcast(message)
+    return "OK"
+
+@app.route("/cron/wednesday")
+def cron_wednesday():
+    key = request.args.get("key")
+    if key != os.getenv("CRON_KEY"):
+        return "Forbidden", 403
+
+    message = (
+        "🌙水曜ヒント🌙\n"
+        "人間関係は“共感”がカギ。聞き役に回ると運気アップ✨\n\n"
+        "#カケルヒント"
+    )
+
+    send_broadcast(message)
+    return "OK"
+
+@app.route("/cron/friday")
+def cron_friday():
+    key = request.args.get("key")
+    if key != os.getenv("CRON_KEY"):
+        return "Forbidden", 403
+
+    message = (
+        "🌃金曜リラックス🌃\n"
+        "今週もおつかれさま！小さなご褒美を自分にあげよう🍀\n\n"
+        "#カケル週末メッセージ"
+    )
+
+    send_broadcast(message)
+    return "OK"
+
+@app.route("/cron/sunday")
+def cron_sunday():
+    key = request.args.get("key")
+    if key != os.getenv("CRON_KEY"):
+        return "Forbidden", 403
+
+    message = (
+        "🌞日曜リセット🌞\n"
+        "心と体を整える時間をとって。次の週に備えてね✨\n\n"
+        "#カケル日曜リセット"
+    )
+
+    send_broadcast(message)
+    return "OK"
+
+@app.route("/cron/moon_auto")
+def cron_moon_auto():
+    key = request.args.get("key")
+    if key != os.getenv("CRON_KEY"):
+        return "Forbidden", 403
+
+    # シンプルに満月／新月っぽいメッセージ
+    today = datetime.now(pytz.timezone("Asia/Tokyo")).day
+    if today in [1, 15]:
+        phase = "🌕満月"
+        msg = "感謝を伝える日。誰かに“ありがとう”を贈ろう✨"
+    elif today in [29, 30]:
+        phase = "🌑新月"
+        msg = "新しい目標を決めるチャンス🌱"
+    else:
+        return "OK (no moon event today)"
+
+    message = f"{phase}メッセージ🌙\n{msg}\n\n#カケル占い"
+    send_broadcast(message)
+    return "OK"
+
+
+# ===== LINEへの一斉送信用 =====
+def send_broadcast(message):
+    try:
+        line_bot_api.broadcast(TextSendMessage(text=message))
+    except Exception as e:
+        print(f"LINE送信エラー: {e}")
