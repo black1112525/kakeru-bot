@@ -11,4 +11,5 @@ aiohttp==3.9.1
 pytz
 supabase
 ephem
+gunicorn==21.2.0
 
