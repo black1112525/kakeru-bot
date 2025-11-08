@@ -95,15 +95,26 @@ def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan
     except Exception as e:
         print(f"❌ ユーザー保存エラー: {e}")
 
+# ←ここ修正版！
 def get_user(user_id: str):
     if not supabase:
+        print("❌ Supabase未接続")
         return None
     try:
         res = supabase.postgrest.from_("users").select("*").eq("user_id", user_id).limit(1).execute()
-        rows = getattr(res, "data", None) or []
-        user = rows[0] if rows else None
-        print("👤 get_user取得:", user)
-        return user
+
+        user_data = None
+        if hasattr(res, "data") and res.data:
+            user_data = res.data[0]
+        elif isinstance(res, dict) and res.get("data"):
+            user_data = res["data"][0]
+
+        if user_data:
+            print(f"👤 ユーザー取得成功: {user_data}")
+        else:
+            print(f"⚠️ ユーザー未登録: {user_id}")
+
+        return user_data
     except Exception as e:
         print(f"❌ ユーザー取得エラー: {e}")
         return None
@@ -274,61 +285,6 @@ def sunday():
     send_line_message(ADMIN_ID, msg)
     log_message_to_supabase(ADMIN_ID, msg, "sunday")
     return "✅ Sunday sent"
-
-# ========================
-# おみくじ
-# ========================
-@app.route("/cron/omikuji")
-def omikuji():
-    check_key()
-    fortunes = [
-        "大吉✨最高の一日になりそう！",
-        "中吉😊穏やかな幸せが訪れそう。",
-        "小吉🍀小さな幸運を見逃さないでね。",
-        "吉🌸努力が実る兆し。",
-        "凶💦焦らずチャンスを待とう。"
-    ]
-    msg = f"🔮 今日の恋みくじ：{random.choice(fortunes)}"
-    send_line_message(ADMIN_ID, msg)
-    log_message_to_supabase(ADMIN_ID, msg, "omikuji")
-    return "✅ Omikuji sent"
-
-# ========================
-# 週次レポート
-# ========================
-@app.route("/cron/weekly_report")
-def weekly_report():
-    check_key()
-    try:
-        now = datetime.now(TZ)
-        start = now - timedelta(days=7)
-        res = supabase.table("logs").select("*").gte("created_at", start.isoformat()).execute()
-        logs = res.data or []
-
-        report = "📊【カケル週報】\n"
-        report += f"記録件数：{len(logs)}件\n"
-        ai_count = sum(1 for l in logs if l.get("type") == "ai")
-        report += f"AI返信数：{ai_count}件\n"
-
-        mini = json.dumps(logs[:200], ensure_ascii=False)[:3000]
-        ai_summary = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "あなたは恋愛相談AI『カケル』の運用アシスタントです。"},
-                {"role": "user", "content": "以下は今週の会話ログです。主要な相談テーマを3点以内、運用改善提案を2点、合計120字以内で要約して。\n" + mini}
-            ],
-            temperature=0.6,
-            max_tokens=160,
-        )
-        summary = ai_summary.choices[0].message.content.strip()
-        report += "\n🧠【AI分析】\n" + summary
-
-        send_line_message(ADMIN_ID, report[:490])
-        log_message_to_supabase(ADMIN_ID, report, "weekly_report")
-        return "✅ Weekly report sent"
-    except Exception as e:
-        print(f"❌ Weekly report error: {e}")
-        return str(e)
 
 # ========================
 # Render スリープ防止
