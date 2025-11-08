@@ -98,24 +98,33 @@ def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan
         print(f"❌ ユーザー保存エラー: {e}")
 
 def get_user(user_id: str):
-    """ユーザーデータ取得（v1/v2両対応版・ループ修正版）"""
+    """ユーザーデータ取得（v1/v2対応＋ループ防止版）"""
     if not supabase:
         print("❌ Supabase未接続")
         return None
     try:
         res = supabase.table("users").select("*").eq("user_id", user_id).limit(1).execute()
-        # v1/v2両対応
+        print("🧾 Supabaseレスポンス:", res)
+
+        # v1/v2対応
+        data = []
         if isinstance(res, dict):
-            data = res.get("data", [])
-        elif hasattr(res, "data"):
+            data = res.get("data") or res.get("body") or []
+        elif hasattr(res, "data") and res.data:
             data = res.data
-        elif hasattr(res, "json"):
-            data = res.json.get("data", [])
+        elif hasattr(res, "json") and hasattr(res.json, "get"):
+            data = res.json.get("data") or []
+        elif hasattr(res, "body"):
+            body = getattr(res, "body", {})
+            if isinstance(body, dict):
+                data = body.get("data", [])
         else:
-            data = []
+            print("⚠️ Supabaseデータ構造が未対応形式:", type(res))
+
         if not data:
             print(f"⚠️ ユーザー未登録またはデータ空: {user_id}")
             return None
+
         user = data[0]
         print(f"👤 ユーザーデータ取得成功: {user}")
         return user
@@ -272,6 +281,24 @@ def sunday():
     send_line_message(ADMIN_ID, msg)
     log_message_to_supabase(ADMIN_ID, msg, "sunday")
     return "✅ Sunday sent"
+
+# ========================
+# おみくじ
+# ========================
+@app.route("/cron/omikuji")
+def omikuji():
+    check_key()
+    fortunes = [
+        "大吉✨最高の一日になりそう！",
+        "中吉😊穏やかな幸せが訪れそう。",
+        "小吉🍀小さな幸運を見逃さないでね。",
+        "吉🌸努力が実る兆し。",
+        "凶💦焦らずチャンスを待とう。"
+    ]
+    msg = f"🔮 今日の恋みくじ：{random.choice(fortunes)}"
+    send_line_message(ADMIN_ID, msg)
+    log_message_to_supabase(ADMIN_ID, msg, "omikuji")
+    return "✅ Omikuji sent"
 
 # ========================
 # スリープ防止
