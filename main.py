@@ -75,10 +75,10 @@ def log_message_to_supabase(user_id: str, message: str, log_type: str = "auto"):
         print(f"❌ ログ保存エラー: {e}")
 
 # ========================
-# ユーザー管理（マージ対応版）
+# ユーザー管理（取得・マージ保存）
 # ========================
 def get_user(user_id: str):
-    """ユーザーデータ取得（ループ防止＋構造対応）"""
+    """ユーザーデータ取得（レスポンス構造差異に強い）"""
     if not supabase:
         print("❌ Supabase未接続")
         return None
@@ -106,24 +106,23 @@ def get_user(user_id: str):
         return None
 
 def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan="free"):
-    """既存データを保持してマージ保存"""
+    """既存値を保持してマージUpsert（on_conflict 正式版）"""
     if not supabase:
         print("❌ Supabase未接続。スキップ")
         return
-
     try:
         existing = get_user(user_id) or {}
         data = {
             "user_id": user_id,
-            "gender": gender or existing.get("gender"),
-            "status": status or existing.get("status"),
-            "feeling": feeling or existing.get("feeling"),
-            "plan": plan or existing.get("plan", "free"),
+            "gender": gender if gender is not None else existing.get("gender"),
+            "status": status if status is not None else existing.get("status"),
+            "feeling": feeling if feeling is not None else existing.get("feeling"),
+            "plan": plan if plan is not None else existing.get("plan", "free"),
             "updated_at": now_iso(),
             "created_at": existing.get("created_at", now_iso()),
         }
-
         print("💾 upsertデータ:", data)
+        # ← ここが要点：on_conflict は文字列
         res = supabase.table("users").upsert(data, on_conflict="user_id").execute()
         print("✅ Supabase upsert結果:", res)
     except Exception as e:
@@ -136,7 +135,8 @@ def get_recent_conversation(user_id: str, limit=10):
     if not supabase:
         return []
     try:
-        res = supabase.table("logs").select("message, type").eq("user_id", user_id).order("created_at", desc=True).limit(limit).execute()
+        res = supabase.table("logs").select("message, type").eq("user_id", user_id)\
+            .order("created_at", desc=True).limit(limit).execute()
         logs = res.data or []
         convo = []
         for l in logs[::-1]:
@@ -179,7 +179,6 @@ def generate_ai_reply(user_id: str, user_message: str):
         f"ユーザー属性: 性別={gender}, 状況={status}\n"
         "相手に寄り添い、安心できる言葉で2〜4文で返答してください。"
     )
-
     history = get_recent_conversation(user_id)
     messages = [{"role": "system", "content": system_prompt}] + history
     messages.append({"role": "user", "content": user_message})
@@ -197,7 +196,7 @@ def generate_ai_reply(user_id: str, user_message: str):
         return "ごめんね、少し考えすぎちゃったみたい。もう一度話してくれる？"
 
 # ========================
-# Webhook
+# Webhook（質問スキップ防止ロジック込み）
 # ========================
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -210,11 +209,14 @@ def callback():
             print(f"📩 {user_id}: {user_message}")
 
             user = get_user(user_id)
+
+            # 1) 初回
             if not user:
                 save_user_profile(user_id)
                 send_line_message(user_id, "はじめまして、カケルです。\nまず、性別を教えてください（男性／女性／その他）")
                 continue
 
+            # 2) 性別
             if not user.get("gender"):
                 g = normalize_gender(user_message)
                 if g:
@@ -224,6 +226,7 @@ def callback():
                     send_line_message(user_id, "ごめん、もう一度だけ！性別を教えてね（男性／女性／その他）")
                 continue
 
+            # 3) 状況
             if not user.get("status"):
                 s = normalize_status(user_message)
                 if s:
@@ -233,11 +236,14 @@ def callback():
                     send_line_message(user_id, "状況を教えてね（片思い／交際中／失恋／その他）")
                 continue
 
-            if not user.get("feeling"):
+            # 4) 気持ち（空文字も未設定扱いにする）
+            if not user.get("feeling") or user.get("feeling") in ["", None]:
+                # このメッセージを feeling として採用
                 save_user_profile(user_id, feeling=user_message[:120])
                 send_line_message(user_id, "ありがとう。あなたの気持ち、大切に受け取ったよ。これから一緒に考えていこう。")
                 continue
 
+            # 5) 以降はAI応答
             reply = generate_ai_reply(user_id, user_message)
             send_line_message(user_id, reply)
             log_message_to_supabase(user_id, user_message, "user")
