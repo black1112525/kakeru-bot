@@ -48,12 +48,10 @@ def now_iso():
     return datetime.now(TZ).isoformat()
 
 def check_key():
-    """CRON認証キー検証"""
     if request.args.get("key") != CRON_KEY:
         abort(403)
 
 def send_line_message(user_id: str, text: str):
-    """LINEプッシュ送信"""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
@@ -75,10 +73,9 @@ def log_message_to_supabase(user_id: str, message: str, log_type: str = "auto"):
         print(f"❌ ログ保存エラー: {e}")
 
 # ========================
-# ユーザー管理（修正版）
+# ユーザー管理（PostgREST版）
 # ========================
 def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan="free"):
-    """Supabaseへユーザー情報を保存（確実動作版）"""
     if not supabase:
         print("❌ Supabase未接続。スキップ")
         return
@@ -102,8 +99,11 @@ def get_user(user_id: str):
     if not supabase:
         return None
     try:
-        res = supabase.table("users").select("*").eq("user_id", user_id).limit(1).execute()
-        return res.data[0] if res.data else None
+        res = supabase.postgrest.from_("users").select("*").eq("user_id", user_id).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        user = rows[0] if rows else None
+        print("👤 get_user取得:", user)
+        return user
     except Exception as e:
         print(f"❌ ユーザー取得エラー: {e}")
         return None
@@ -222,6 +222,23 @@ def callback():
             log_message_to_supabase(user_id, user_message, "user")
             log_message_to_supabase(user_id, reply, "ai")
     return "OK"
+
+# ========================
+# デバッグ用ルート
+# ========================
+@app.route("/debug/test_upsert")
+def debug_test_upsert():
+    check_key()
+    uid = request.args.get("uid", "TEST_USER")
+    save_user_profile(uid, gender="男性", status="交際中", feeling="テストOK")
+    return f"upsert sent for {uid}"
+
+@app.route("/debug/get_user")
+def debug_get_user():
+    check_key()
+    uid = request.args.get("uid", "TEST_USER")
+    u = get_user(uid)
+    return json.dumps(u or {}, ensure_ascii=False)
 
 # ========================
 # 定期配信（月・水・金・日）
