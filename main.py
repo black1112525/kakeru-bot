@@ -13,7 +13,6 @@ from openai import OpenAI
 
 # Flaskアプリ起動
 app = Flask(__name__)
-TZ = pytz.timezone("Asia/Tokyo")
 
 # === 環境変数 ===
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
@@ -21,8 +20,10 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_ID = os.getenv("ADMIN_ID", "Uxxxxxxxx")
+ADMIN_ID = os.getenv("ADMIN_ID", "Uxxxxxxxx")  # 管理者LINE ID
 CRON_KEY = os.getenv("CRON_KEY")
+
+TZ = pytz.timezone("Asia/Tokyo")
 
 # === Supabase接続 ===
 try:
@@ -32,7 +33,7 @@ except Exception as e:
     print(f"❌ Supabase connection error: {e}")
     supabase = None
 
-# === OpenAI ===
+# === OpenAIクライアント ===
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # === LINE送信 ===
@@ -65,10 +66,11 @@ def log_message_to_supabase(user_id, message, log_type="auto"):
     except Exception as e:
         print(f"❌ Supabaseログ保存エラー: {e}")
 
-# === ユーザープロフィール保存 ===
+# === ユーザー登録・更新 ===
 def save_user_profile(user_id, gender=None, status=None, feeling=None, plan="free"):
+    """ユーザー情報をSupabaseに保存"""
     if not supabase:
-        print("⚠️ Supabase未接続。ユーザープロフィールは保存されません。")
+        print("⚠️ Supabase未接続。ユーザーデータは保存されません。")
         return
     try:
         data = {
@@ -78,13 +80,19 @@ def save_user_profile(user_id, gender=None, status=None, feeling=None, plan="fre
             "feeling": feeling,
             "plan": plan,
             "updated_at": datetime.now(TZ).isoformat(),
+            "created_at": datetime.now(TZ).isoformat(),
         }
-        supabase.table("users").upsert(data, on_conflict="user_id").execute()
-        print(f"🧍ユーザープロフィール保存成功: {user_id}")
+        res = supabase.table("users").upsert(data, on_conflict=["user_id"]).execute()
+        print(f"🗂 ユーザーデータ保存成功: {user_id}")
     except Exception as e:
-        print(f"❌ユーザープロフィール保存エラー: {e}")
+        print(f"❌ ユーザー保存エラー: {e}")
 
-# === 会話履歴取得 ===
+# === 認証チェック ===
+def check_key():
+    if request.args.get("key") != CRON_KEY:
+        abort(403)
+
+# === 過去会話履歴取得 ===
 def get_recent_conversation(user_id, limit=10):
     if not supabase:
         return []
@@ -102,37 +110,38 @@ def get_recent_conversation(user_id, limit=10):
         print(f"⚠️ 会話履歴取得エラー: {e}")
         return []
 
-# === AI返信生成 ===
+# === AI返信生成（記憶＋性別登録対応） ===
 def generate_ai_reply(user_id, user_message):
-    # ユーザー属性を取得
-    user_info = supabase.table("users").select("*").eq("user_id", user_id).execute().data
-    gender = user_info[0]["gender"] if user_info else "未設定"
-    status = user_info[0]["status"] if user_info else "不明"
-
     system_prompt = (
-        f"あなたは『カケル』という誠実で優しい恋愛相談員です。\n"
-        f"性別: {gender}\n"
-        f"状況: {status}\n"
+        "あなたは『カケル』という誠実で優しい恋愛相談員です。\n"
         "相手の気持ちを受け止め、共感を伝え、安心できる言葉を返してください。\n"
-        "丁寧で優しい言葉遣いで2〜4文にまとめてください。"
+        "丁寧な言葉遣いで2〜4文程度にまとめてください。"
     )
+
+    # 性別登録の判定
+    if "男性" in user_message:
+        save_user_profile(user_id, gender="男性")
+        return "ありがとうございます。今の恋の状況を教えてもらえますか？（片想い／交際中／失恋など）"
+    elif "女性" in user_message:
+        save_user_profile(user_id, gender="女性")
+        return "ありがとうございます。恋の調子はどう？（片想い／交際中／失恋など）"
+    elif "その他" in user_message:
+        save_user_profile(user_id, gender="その他")
+        return "ありがとうございます。あなたの今の恋の状況を教えてください。"
 
     history = get_recent_conversation(user_id, limit=10)
     messages = [{"role": "system", "content": system_prompt}] + history
     messages.append({"role": "user", "content": user_message})
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.8,
-        )
-        return response.choices[0].message.content.strip()
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.8)
+        reply = response.choices[0].message.content.strip()
+        return reply
     except Exception as e:
         print(f"❌ OpenAI返答エラー: {e}")
         return "ごめんなさい、少し考え込んでしまいました。もう一度話してもらえますか？"
 
-# === Webhook（質問フロー付き） ===
+# === Webhook受信 ===
 @app.route("/callback", methods=["POST"])
 def callback():
     body = request.get_json()
@@ -142,35 +151,18 @@ def callback():
         if event["type"] == "message" and event["message"]["type"] == "text":
             user_id = event["source"]["userId"]
             user_message = event["message"]["text"]
+            print(f"💬 {user_id}: {user_message}")
 
-            # 新規ユーザー確認
+            # --- 初回ユーザー判定 ---
             res = supabase.table("users").select("*").eq("user_id", user_id).execute()
-            is_new = len(res.data) == 0
-
-            if is_new:
-                send_line_message(user_id,
-                    "はじめまして、カケルです。\nあなたの恋の状況を少し教えてください。\nまず、性別を教えてください（男性／女性／その他）")
+            if not res.data:
+                send_line_message(
+                    user_id,
+                    "はじめまして、カケルです。\nあなたの恋の状況を少し教えてください。\nまず、性別を教えてください（男性／女性／その他）"
+                )
                 save_user_profile(user_id)
-                return "OK"
+                continue
 
-            user_data = res.data[0]
-
-            if not user_data.get("gender"):
-                supabase.table("users").update({"gender": user_message}).eq("user_id", user_id).execute()
-                send_line_message(user_id, "ありがとう😊\n次に、今の恋愛の状況を教えてください（片思い・交際中・失恋・その他）")
-                return "OK"
-
-            elif not user_data.get("status"):
-                supabase.table("users").update({"status": user_message}).eq("user_id", user_id).execute()
-                send_line_message(user_id, "なるほど…！\n最後に、今の気持ちをひとことで教えてください（例：寂しい・モヤモヤ・楽しいなど）")
-                return "OK"
-
-            elif not user_data.get("feeling"):
-                supabase.table("users").update({"feeling": user_message}).eq("user_id", user_id).execute()
-                send_line_message(user_id, "ありがとう。あなたの気持ち、大切に受け取りました。\nこれから一緒に考えていこう。")
-                return "OK"
-
-            # 通常AI応答
             reply = generate_ai_reply(user_id, user_message)
             send_line_message(user_id, reply)
             log_message_to_supabase(user_id, user_message, "user")
@@ -178,7 +170,7 @@ def callback():
 
     return "OK"
 
-# === 定期配信など（君の現行コードそのまま） ===
+# === 定期配信 ===
 @app.route("/cron/monday")
 def monday():
     check_key()
@@ -226,7 +218,7 @@ def omikuji():
     log_message_to_supabase(ADMIN_ID, msg, "omikuji")
     return "✅ Omikuji sent"
 
-# === 週次レポートなど（現行維持） ===
+# === 週次レポート ===
 @app.route("/cron/weekly_report")
 def weekly_report():
     check_key()
@@ -235,9 +227,21 @@ def weekly_report():
         start = now - timedelta(days=7)
         res = supabase.table("logs").select("*").gte("created_at", start.isoformat()).execute()
         logs = res.data
-        report = f"📊【カケル週報】\n記録件数：{len(logs)}件\n"
+        report = "📊【カケル週報】\n\n"
+        report += f"記録件数：{len(logs)}件\n"
         ai_messages = [l for l in logs if l["type"] == "ai"]
         report += f"AI返信数：{len(ai_messages)}件\n"
+
+        ai_summary = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "あなたは恋愛相談AI『カケル』の週報アシスタントです。"},
+                {"role": "user", "content": f"以下は今週の会話ログです:\n{logs}"}
+            ]
+        )
+        summary = ai_summary.choices[0].message.content.strip()
+        report += "\n🧠【AI分析】\n" + summary
+
         send_line_message(ADMIN_ID, report[:490])
         log_message_to_supabase(ADMIN_ID, report, "weekly_report")
         return "✅ Weekly report sent"
@@ -255,10 +259,9 @@ def keep_alive():
             except Exception as e:
                 print(f"⚠️ Keep-alive ping error: {e}")
             time.sleep(600)
-    thread = threading.Thread(target=ping)
-    thread.daemon = True
-    thread.start()
+    threading.Thread(target=ping, daemon=True).start()
 
+# === 動作確認 ===
 @app.route("/health")
 def health():
     return "OK", 200
@@ -267,6 +270,7 @@ def health():
 def home():
     return "🌸 Kakeru Bot running gently with memory!"
 
+# === メイン実行 ===
 if __name__ == "__main__":
     keep_alive()
     app.run(host="0.0.0.0", port=10000)
