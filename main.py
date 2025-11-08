@@ -92,7 +92,8 @@ def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan
     }
     try:
         print("💾 upsertデータ:", data)
-        res = supabase.table("users").upsert(data, on_conflict=["user_id"]).execute()
+        # ✅ 修正版：on_conflictをリスト→文字列に変更
+        res = supabase.table("users").upsert(data, on_conflict="user_id").execute()
         print("✅ Supabase upsert結果:", res)
     except Exception as e:
         print(f"❌ ユーザー保存エラー: {e}")
