@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import requests
 import threading
 import time
@@ -47,6 +48,7 @@ def now_iso():
     return datetime.now(TZ).isoformat()
 
 def check_key():
+    """CRON認証キー検証"""
     if request.args.get("key") != CRON_KEY:
         abort(403)
 
@@ -73,10 +75,12 @@ def log_message_to_supabase(user_id: str, message: str, log_type: str = "auto"):
         print(f"❌ ログ保存エラー: {e}")
 
 # ========================
-# ユーザー管理
+# ユーザー管理（修正版）
 # ========================
 def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan="free"):
+    """Supabaseへユーザー情報を保存（確実動作版）"""
     if not supabase:
+        print("❌ Supabase未接続。スキップ")
         return
     data = {
         "user_id": user_id,
@@ -88,8 +92,9 @@ def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan
         "created_at": now_iso(),
     }
     try:
-        supabase.table("users").upsert(data, on_conflict=["user_id"]).execute()
-        print(f"🧍ユーザーデータ保存: {user_id}")
+        print("💾 upsertデータ:", data)
+        res = supabase.postgrest.from_("users").upsert(data, on_conflict=["user_id"]).execute()
+        print("✅ Supabase upsert結果:", res)
     except Exception as e:
         print(f"❌ ユーザー保存エラー: {e}")
 
