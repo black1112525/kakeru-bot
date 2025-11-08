@@ -75,38 +75,15 @@ def log_message_to_supabase(user_id: str, message: str, log_type: str = "auto"):
         print(f"❌ ログ保存エラー: {e}")
 
 # ========================
-# ユーザー管理
+# ユーザー管理（マージ対応版）
 # ========================
-def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan="free"):
-    if not supabase:
-        print("❌ Supabase未接続。スキップ")
-        return
-    data = {
-        "user_id": user_id,
-        "gender": gender,
-        "status": status,
-        "feeling": feeling,
-        "plan": plan,
-        "updated_at": now_iso(),
-        "created_at": now_iso(),
-    }
-    try:
-        print("💾 upsertデータ:", data)
-        # ✅ 修正版：on_conflictをリスト→文字列に変更
-        res = supabase.table("users").upsert(data, on_conflict="user_id").execute()
-        print("✅ Supabase upsert結果:", res)
-    except Exception as e:
-        print(f"❌ ユーザー保存エラー: {e}")
-
 def get_user(user_id: str):
-    """ユーザーデータ取得（全構造対応＋ループ防止修正版）"""
+    """ユーザーデータ取得（ループ防止＋構造対応）"""
     if not supabase:
         print("❌ Supabase未接続")
         return None
     try:
         res = supabase.table("users").select("*").eq("user_id", user_id).limit(1).execute()
-        print("🧾 Supabaseレスポンス:", res)
-
         data = None
         if hasattr(res, "data") and res.data:
             data = res.data
@@ -124,10 +101,33 @@ def get_user(user_id: str):
         user = data[0]
         print(f"👤 ユーザーデータ取得成功: {user}")
         return user
-
     except Exception as e:
         print(f"❌ ユーザー取得エラー: {e}")
         return None
+
+def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan="free"):
+    """既存データを保持してマージ保存"""
+    if not supabase:
+        print("❌ Supabase未接続。スキップ")
+        return
+
+    try:
+        existing = get_user(user_id) or {}
+        data = {
+            "user_id": user_id,
+            "gender": gender or existing.get("gender"),
+            "status": status or existing.get("status"),
+            "feeling": feeling or existing.get("feeling"),
+            "plan": plan or existing.get("plan", "free"),
+            "updated_at": now_iso(),
+            "created_at": existing.get("created_at", now_iso()),
+        }
+
+        print("💾 upsertデータ:", data)
+        res = supabase.table("users").upsert(data, on_conflict="user_id").execute()
+        print("✅ Supabase upsert結果:", res)
+    except Exception as e:
+        print(f"❌ ユーザー保存エラー: {e}")
 
 # ========================
 # 会話履歴取得
