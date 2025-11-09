@@ -75,40 +75,26 @@ def log_message_to_supabase(user_id: str, message: str, log_type: str = "auto"):
         print(f"❌ ログ保存エラー: {e}")
 
 # ========================
-# ユーザー管理（取得・マージ保存）
+# ユーザー管理（マージ保存対応）
 # ========================
 def get_user(user_id: str):
-    """ユーザーデータ取得（レスポンス構造差異に強い）"""
     if not supabase:
-        print("❌ Supabase未接続")
         return None
     try:
         res = supabase.table("users").select("*").eq("user_id", user_id).limit(1).execute()
-        data = None
         if hasattr(res, "data") and res.data:
-            data = res.data
-        elif hasattr(res, "records") and res.records:
-            data = res.records
-        elif hasattr(res, "body") and isinstance(res.body, dict):
-            data = res.body.get("data")
+            return res.data[0]
         elif isinstance(res, dict):
-            data = res.get("data") or (res.get("body", {}) or {}).get("data")
-
-        if not data:
-            print(f"⚠️ ユーザー未登録または空: {user_id}")
-            return None
-
-        user = data[0]
-        print(f"👤 ユーザーデータ取得成功: {user}")
-        return user
+            return (res.get("data") or [None])[0]
+        return None
     except Exception as e:
         print(f"❌ ユーザー取得エラー: {e}")
         return None
 
 def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan="free"):
-    """既存値を保持してマージUpsert（on_conflict 正式版）"""
+    """既存値とマージ保存（on_conflict修正版）"""
     if not supabase:
-        print("❌ Supabase未接続。スキップ")
+        print("❌ Supabase未接続")
         return
     try:
         existing = get_user(user_id) or {}
@@ -121,10 +107,8 @@ def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan
             "updated_at": now_iso(),
             "created_at": existing.get("created_at", now_iso()),
         }
-        print("💾 upsertデータ:", data)
-        # ← ここが要点：on_conflict は文字列
         res = supabase.table("users").upsert(data, on_conflict="user_id").execute()
-        print("✅ Supabase upsert結果:", res)
+        print(f"💾 ユーザーデータ保存: {data}")
     except Exception as e:
         print(f"❌ ユーザー保存エラー: {e}")
 
@@ -173,12 +157,12 @@ def generate_ai_reply(user_id: str, user_message: str):
     user = get_user(user_id) or {}
     gender = user.get("gender") or "未設定"
     status = user.get("status") or "不明"
-
     system_prompt = (
         f"あなたは『カケル』という優しい恋愛相談AIです。\n"
         f"ユーザー属性: 性別={gender}, 状況={status}\n"
         "相手に寄り添い、安心できる言葉で2〜4文で返答してください。"
     )
+
     history = get_recent_conversation(user_id)
     messages = [{"role": "system", "content": system_prompt}] + history
     messages.append({"role": "user", "content": user_message})
@@ -196,7 +180,7 @@ def generate_ai_reply(user_id: str, user_message: str):
         return "ごめんね、少し考えすぎちゃったみたい。もう一度話してくれる？"
 
 # ========================
-# Webhook（質問スキップ防止ロジック込み）
+# Webhook
 # ========================
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -209,14 +193,11 @@ def callback():
             print(f"📩 {user_id}: {user_message}")
 
             user = get_user(user_id)
-
-            # 1) 初回
             if not user:
                 save_user_profile(user_id)
                 send_line_message(user_id, "はじめまして、カケルです。\nまず、性別を教えてください（男性／女性／その他）")
                 continue
 
-            # 2) 性別
             if not user.get("gender"):
                 g = normalize_gender(user_message)
                 if g:
@@ -226,7 +207,6 @@ def callback():
                     send_line_message(user_id, "ごめん、もう一度だけ！性別を教えてね（男性／女性／その他）")
                 continue
 
-            # 3) 状況
             if not user.get("status"):
                 s = normalize_status(user_message)
                 if s:
@@ -236,14 +216,11 @@ def callback():
                     send_line_message(user_id, "状況を教えてね（片思い／交際中／失恋／その他）")
                 continue
 
-            # 4) 気持ち（空文字も未設定扱いにする）
             if not user.get("feeling") or user.get("feeling") in ["", None]:
-                # このメッセージを feeling として採用
                 save_user_profile(user_id, feeling=user_message[:120])
                 send_line_message(user_id, "ありがとう。あなたの気持ち、大切に受け取ったよ。これから一緒に考えていこう。")
                 continue
 
-            # 5) 以降はAI応答
             reply = generate_ai_reply(user_id, user_message)
             send_line_message(user_id, reply)
             log_message_to_supabase(user_id, user_message, "user")
@@ -302,6 +279,43 @@ def omikuji():
     send_line_message(ADMIN_ID, msg)
     log_message_to_supabase(ADMIN_ID, msg, "omikuji")
     return "✅ Omikuji sent"
+
+# ========================
+# 週次レポート
+# ========================
+@app.route("/cron/weekly_report")
+def weekly_report():
+    check_key()
+    try:
+        now = datetime.now(TZ)
+        start = now - timedelta(days=7)
+        res = supabase.table("logs").select("*").gte("created_at", start.isoformat()).execute()
+        logs = res.data or []
+
+        report = "📊【カケル週報】\n"
+        report += f"記録件数：{len(logs)}件\n"
+        ai_count = sum(1 for l in logs if l.get("type") == "ai")
+        report += f"AI返信数：{ai_count}件\n"
+
+        mini = json.dumps(logs[:200], ensure_ascii=False)[:3000]
+        ai_summary = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "あなたは恋愛相談AI『カケル』の運用アシスタントです。"},
+                {"role": "user", "content": "以下は今週の会話ログです。主要な相談テーマを3点以内、運用改善提案を2点、合計120字以内で要約して。\n" + mini}
+            ],
+            temperature=0.6,
+            max_tokens=160,
+        )
+        summary = ai_summary.choices[0].message.content.strip()
+        report += "\n🧠【AI分析】\n" + summary
+
+        send_line_message(ADMIN_ID, report[:490])
+        log_message_to_supabase(ADMIN_ID, report, "weekly_report")
+        return "✅ Weekly report sent"
+    except Exception as e:
+        print(f"❌ Weekly report error: {e}")
+        return str(e)
 
 # ========================
 # スリープ防止
