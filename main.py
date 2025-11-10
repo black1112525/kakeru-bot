@@ -48,7 +48,6 @@ def now_iso():
     return datetime.now(TZ).isoformat()
 
 def check_key():
-    """CRON認証キー検証"""
     if request.args.get("key") != CRON_KEY:
         abort(403)
 
@@ -61,9 +60,9 @@ def send_line_message(user_id: str, text: str):
     data = {"to": user_id, "messages": [{"type": "text", "text": text[:490]}]}
     try:
         res = requests.post("https://api.line.me/v2/bot/message/push", headers=headers, json=data)
-        print(f"📤 LINE送信ステータス: {res.status_code}")
+        print(f"📤 LINE送信({user_id}) → {res.status_code}")
     except Exception as e:
-        print(f"❌ LINE送信エラー: {e}")
+        print(f"❌ LINE送信エラー({user_id}): {e}")
 
 def log_message_to_supabase(user_id: str, message: str, log_type: str = "auto"):
     if not supabase:
@@ -73,6 +72,27 @@ def log_message_to_supabase(user_id: str, message: str, log_type: str = "auto"):
         supabase.table("logs").insert(data).execute()
     except Exception as e:
         print(f"❌ ログ保存エラー: {e}")
+
+# ========================
+# 全ユーザー送信関数
+# ========================
+def broadcast_message(msg: str):
+    """登録済み全ユーザーに送信"""
+    if not supabase:
+        print("❌ Supabase未接続。送信中止。")
+        return
+    try:
+        res = supabase.table("users").select("user_id").execute()
+        users = res.data or []
+        print(f"📡 全ユーザー送信開始: {len(users)}人")
+        for u in users:
+            uid = u.get("user_id")
+            if uid:
+                send_line_message(uid, msg)
+                time.sleep(0.3)  # LINE制限回避
+        print("✅ 全ユーザー送信完了")
+    except Exception as e:
+        print(f"❌ 全体送信エラー: {e}")
 
 # ========================
 # ユーザー管理（マージ保存対応）
@@ -107,7 +127,7 @@ def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan
             "updated_at": now_iso(),
             "created_at": existing.get("created_at", now_iso()),
         }
-        res = supabase.table("users").upsert(data, on_conflict="user_id").execute()
+        supabase.table("users").upsert(data, on_conflict="user_id").execute()
         print(f"💾 ユーザーデータ保存: {data}")
     except Exception as e:
         print(f"❌ ユーザー保存エラー: {e}")
@@ -119,8 +139,7 @@ def get_recent_conversation(user_id: str, limit=10):
     if not supabase:
         return []
     try:
-        res = supabase.table("logs").select("message, type").eq("user_id", user_id)\
-            .order("created_at", desc=True).limit(limit).execute()
+        res = supabase.table("logs").select("message, type").eq("user_id", user_id).order("created_at", desc=True).limit(limit).execute()
         logs = res.data or []
         convo = []
         for l in logs[::-1]:
@@ -157,6 +176,7 @@ def generate_ai_reply(user_id: str, user_message: str):
     user = get_user(user_id) or {}
     gender = user.get("gender") or "未設定"
     status = user.get("status") or "不明"
+
     system_prompt = (
         f"あなたは『カケル』という優しい恋愛相談AIです。\n"
         f"ユーザー属性: 性別={gender}, 状況={status}\n"
@@ -228,43 +248,40 @@ def callback():
     return "OK"
 
 # ========================
-# 定期配信（月・水・金・日）
+# 定期配信（月・水・金・日・おみくじ）
 # ========================
 @app.route("/cron/monday")
 def monday():
     check_key()
     msg = "🌅月曜メッセージ：新しい週の始まり、焦らず少しずつ進もう。"
-    send_line_message(ADMIN_ID, msg)
-    log_message_to_supabase(ADMIN_ID, msg, "monday")
-    return "✅ Monday sent"
+    broadcast_message(msg)
+    log_message_to_supabase("system", msg, "monday")
+    return "✅ Monday broadcast sent"
 
 @app.route("/cron/wednesday")
 def wednesday():
     check_key()
     msg = "🌤水曜メッセージ：週の折り返し、リズムを整えてね。"
-    send_line_message(ADMIN_ID, msg)
-    log_message_to_supabase(ADMIN_ID, msg, "wednesday")
-    return "✅ Wednesday sent"
+    broadcast_message(msg)
+    log_message_to_supabase("system", msg, "wednesday")
+    return "✅ Wednesday broadcast sent"
 
 @app.route("/cron/friday")
 def friday():
     check_key()
     msg = "🌙金曜メッセージ：1週間お疲れさま。今夜はゆっくり休もう。"
-    send_line_message(ADMIN_ID, msg)
-    log_message_to_supabase(ADMIN_ID, msg, "friday")
-    return "✅ Friday sent"
+    broadcast_message(msg)
+    log_message_to_supabase("system", msg, "friday")
+    return "✅ Friday broadcast sent"
 
 @app.route("/cron/sunday")
 def sunday():
     check_key()
     msg = "☀️日曜メッセージ：今週もよく頑張りましたね。感謝してリセットしよう。"
-    send_line_message(ADMIN_ID, msg)
-    log_message_to_supabase(ADMIN_ID, msg, "sunday")
-    return "✅ Sunday sent"
+    broadcast_message(msg)
+    log_message_to_supabase("system", msg, "sunday")
+    return "✅ Sunday broadcast sent"
 
-# ========================
-# おみくじ
-# ========================
 @app.route("/cron/omikuji")
 def omikuji():
     check_key()
@@ -276,12 +293,12 @@ def omikuji():
         "凶💦焦らずチャンスを待とう。"
     ]
     msg = f"🔮 今日の恋みくじ：{random.choice(fortunes)}"
-    send_line_message(ADMIN_ID, msg)
-    log_message_to_supabase(ADMIN_ID, msg, "omikuji")
-    return "✅ Omikuji sent"
+    broadcast_message(msg)
+    log_message_to_supabase("system", msg, "omikuji")
+    return "✅ Omikuji broadcast sent"
 
 # ========================
-# 週次レポート
+# 週次レポート（管理者専用）
 # ========================
 @app.route("/cron/weekly_report")
 def weekly_report():
@@ -310,7 +327,7 @@ def weekly_report():
         summary = ai_summary.choices[0].message.content.strip()
         report += "\n🧠【AI分析】\n" + summary
 
-        send_line_message(ADMIN_ID, report[:490])
+        send_line_message(ADMIN_ID, report[:490])  # ← 管理者専用
         log_message_to_supabase(ADMIN_ID, report, "weekly_report")
         return "✅ Weekly report sent"
     except Exception as e:
@@ -318,7 +335,7 @@ def weekly_report():
         return str(e)
 
 # ========================
-# スリープ防止
+# Render スリープ防止
 # ========================
 def keep_alive():
     def ping():
