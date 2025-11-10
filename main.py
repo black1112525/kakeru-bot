@@ -6,18 +6,20 @@ import threading
 import time
 from datetime import datetime, timedelta
 import pytz
+import hmac
+import hashlib
 from flask import Flask, request, abort
 from supabase import create_client, Client
 from openai import OpenAI
 
 # ========================
-# Flask アプリ設定
+# Flask / TZ
 # ========================
 app = Flask(__name__)
 TZ = pytz.timezone("Asia/Tokyo")
 
 # ========================
-# 環境変数
+# ENV
 # ========================
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -25,9 +27,11 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = os.getenv("ADMIN_ID", "Uxxxxxxxxx")
 CRON_KEY = os.getenv("CRON_KEY")
+STORES_SECRET = os.getenv("STORES_SECRET")  # STORES署名検証用
+STORES_BASE_URL = os.getenv("STORES_BASE_URL", "https://your-stores-link.com/?line_user_id=")  # 決済リンク
 
 # ========================
-# Supabase 接続
+# Connections
 # ========================
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -36,13 +40,10 @@ except Exception as e:
     print(f"❌ Supabase接続エラー: {e}")
     supabase = None
 
-# ========================
-# OpenAI 接続
-# ========================
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ========================
-# 共通関数
+# Utils
 # ========================
 def now_iso():
     return datetime.now(TZ).isoformat()
@@ -52,11 +53,8 @@ def check_key():
         abort(403)
 
 def send_line_message(user_id: str, text: str):
-    """LINEプッシュ送信"""
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
-    }
+    """LINEプッシュ送信（テキスト）"""
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     data = {"to": user_id, "messages": [{"type": "text", "text": text[:490]}]}
     try:
         res = requests.post("https://api.line.me/v2/bot/message/push", headers=headers, json=data)
@@ -64,54 +62,79 @@ def send_line_message(user_id: str, text: str):
     except Exception as e:
         print(f"❌ LINE送信エラー({user_id}): {e}")
 
+def send_flex(user_id: str, flex_contents: dict, alt_text="メッセージ"):
+    """LINEプッシュ送信（Flex）"""
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    data = {"to": user_id, "messages": [{"type": "flex", "altText": alt_text, "contents": flex_contents}]}
+    try:
+        res = requests.post("https://api.line.me/v2/bot/message/push", headers=headers, json=data)
+        print(f"📤 LINE Flex送信({user_id}) → {res.status_code}")
+    except Exception as e:
+        print(f"❌ LINE Flex送信エラー({user_id}): {e}")
+
 def log_message_to_supabase(user_id: str, message: str, log_type: str = "auto"):
+    """会話ログ保存＋Premiumならlast_active更新"""
     if not supabase:
         return
     try:
-        data = {"user_id": user_id, "message": message, "type": log_type, "created_at": now_iso()}
+        now = now_iso()
+        data = {"user_id": user_id, "message": message, "type": log_type, "created_at": now}
         supabase.table("logs").insert(data).execute()
+
+        # Premiumユーザーの最終会話時間を更新（user/aiどちらでも更新）
+        if user_id not in ("system", "admin"):
+            user = get_user(user_id)
+            if user and user.get("plan") == "premium":
+                supabase.table("users").update({"last_active": now}).eq("user_id", user_id).execute()
     except Exception as e:
         print(f"❌ ログ保存エラー: {e}")
 
+def verify_signature(req):
+    """STORES Webhook署名検証"""
+    if not STORES_SECRET:
+        return True
+    received = req.headers.get("X-Stores-Signature", "")
+    computed = hmac.new(STORES_SECRET.encode(), req.data, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(received, computed)
+
 # ========================
-# 全ユーザー送信関数
+# Broadcast
 # ========================
-def broadcast_message(msg: str):
-    """登録済み全ユーザーに送信"""
+def broadcast_message(msg: str, premium_only: bool = False):
+    """登録済み（条件付き）全ユーザーに送信"""
     if not supabase:
         print("❌ Supabase未接続。送信中止。")
         return
     try:
-        res = supabase.table("users").select("user_id").execute()
+        query = supabase.table("users").select("user_id, plan")
+        if premium_only:
+            query = query.eq("plan", "premium")
+        res = query.execute()
         users = res.data or []
-        print(f"📡 全ユーザー送信開始: {len(users)}人")
+        print(f"📡 {'Premium' if premium_only else '全'}ユーザー送信: {len(users)}人")
         for u in users:
             uid = u.get("user_id")
             if uid:
                 send_line_message(uid, msg)
                 time.sleep(0.3)  # LINE制限回避
-        print("✅ 全ユーザー送信完了")
+        print("✅ 送信完了")
     except Exception as e:
         print(f"❌ 全体送信エラー: {e}")
 
 # ========================
-# ユーザー管理（マージ保存対応）
+# Users
 # ========================
 def get_user(user_id: str):
     if not supabase:
         return None
     try:
         res = supabase.table("users").select("*").eq("user_id", user_id).limit(1).execute()
-        if hasattr(res, "data") and res.data:
-            return res.data[0]
-        elif isinstance(res, dict):
-            return (res.get("data") or [None])[0]
-        return None
+        return res.data[0] if res.data else None
     except Exception as e:
         print(f"❌ ユーザー取得エラー: {e}")
         return None
 
-def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan="free"):
+def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan=None):
     """既存値とマージ保存（on_conflict修正版）"""
     if not supabase:
         print("❌ Supabase未接続")
@@ -126,6 +149,8 @@ def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan
             "plan": plan if plan is not None else existing.get("plan", "free"),
             "updated_at": now_iso(),
             "created_at": existing.get("created_at", now_iso()),
+            # 初回作成時のためにlast_activeが無い場合のみ埋める
+            "last_active": existing.get("last_active") or now_iso(),
         }
         supabase.table("users").upsert(data, on_conflict="user_id").execute()
         print(f"💾 ユーザーデータ保存: {data}")
@@ -133,27 +158,7 @@ def save_user_profile(user_id: str, gender=None, status=None, feeling=None, plan
         print(f"❌ ユーザー保存エラー: {e}")
 
 # ========================
-# 会話履歴取得
-# ========================
-def get_recent_conversation(user_id: str, limit=10):
-    if not supabase:
-        return []
-    try:
-        res = supabase.table("logs").select("message, type").eq("user_id", user_id).order("created_at", desc=True).limit(limit).execute()
-        logs = res.data or []
-        convo = []
-        for l in logs[::-1]:
-            if l["type"] == "user":
-                convo.append({"role": "user", "content": l["message"]})
-            elif l["type"] == "ai":
-                convo.append({"role": "assistant", "content": l["message"]})
-        return convo
-    except Exception as e:
-        print(f"❌ 会話履歴取得エラー: {e}")
-        return []
-
-# ========================
-# 入力正規化
+# Normalizers
 # ========================
 def normalize_gender(text: str):
     t = text.strip().lower()
@@ -170,30 +175,103 @@ def normalize_status(text: str):
     return "その他"
 
 # ========================
-# AI返信生成
+# Conversation helpers
+# ========================
+def get_conversation_count(user_id: str):
+    """ユーザーの発話回数（userタイプのログ件数）"""
+    if not supabase:
+        return 0
+    res = supabase.table("logs").select("id").eq("user_id", user_id).eq("type", "user").execute()
+    return len(res.data or [])
+
+# ========================
+# Premium誘導（Flex）
+# ========================
+def send_premium_invite(user_id: str):
+    """無料ユーザーにPremium登録を案内するFlexメッセージ"""
+    link = f"{STORES_BASE_URL}{user_id}"
+    bubble = {
+        "type": "bubble",
+        "hero": {
+            "type": "image",
+            "url": "https://cdn.pixabay.com/photo/2017/01/06/20/19/diamond-1950120_1280.jpg",
+            "size": "full", "aspectRatio": "16:9", "aspectMode": "cover"
+        },
+        "body": {
+            "type": "box", "layout": "vertical", "contents": [
+                {"type": "text", "text": "💎 カケル Premium", "weight": "bold", "size": "xl"},
+                {"type": "text", "text": "より深く、心に寄り添う特別な時間を。", "wrap": True, "margin": "md"},
+                {"type": "separator", "margin": "md"},
+                {"type": "text", "text": "✨ 特典：\n・心理分析つきAI返信\n・💌 今日の想い（気持ちメモ）\n・安心の毎日メッセージ", "wrap": True, "margin": "md"},
+            ]
+        },
+        "footer": {
+            "type": "box", "layout": "vertical", "contents": [
+                {"type": "button", "style": "primary", "color": "#A16AE8",
+                 "action": {"type": "uri", "label": "💎 Premiumをはじめる！", "uri": link}}
+            ]
+        }
+    }
+    send_flex(user_id, bubble, alt_text="Premiumのご案内")
+
+def send_premium_menu(user_id: str, plan: str):
+    """Premiumユーザー向けのミニメニュー（Flex）を出す / 無料はおみくじのみ"""
+    buttons = []
+    if plan == "premium":
+        buttons.append({"type": "button", "style": "primary",
+                        "action": {"type": "message", "label": "💌 今日の想いを書く", "text": "/diary"}})
+    # 共通：おみくじ
+    buttons.append({"type": "button", "style": "secondary",
+                    "action": {"type": "message", "label": "🔮 おみくじを引く", "text": "/omikuji"}})
+
+    bubble = {
+        "type": "bubble",
+        "body": {
+            "type": "box", "layout": "vertical", "contents": [
+                {"type": "text", "text": "💎 Premiumメニュー", "weight": "bold", "size": "lg"},
+                *buttons
+            ]
+        }
+    }
+    send_flex(user_id, bubble, alt_text="Premiumメニュー")
+
+# ========================
+# AI Reply
 # ========================
 def generate_ai_reply(user_id: str, user_message: str):
     user = get_user(user_id) or {}
+    plan = user.get("plan", "free")
     gender = user.get("gender") or "未設定"
     status = user.get("status") or "不明"
 
-    system_prompt = (
-        f"あなたは『カケル』という優しい恋愛相談AIです。\n"
-        f"ユーザー属性: 性別={gender}, 状況={status}\n"
-        "相手に寄り添い、安心できる言葉で2〜4文で返答してください。"
-    )
-
-    history = get_recent_conversation(user_id)
-    messages = [{"role": "system", "content": system_prompt}] + history
-    messages.append({"role": "user", "content": user_message})
-
-    try:
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.8,
-            timeout=40,
+    if plan == "premium":
+        system_prompt = (
+            f"あなたは恋愛心理AI『カケルPremium』です。\n"
+            f"ユーザー属性: 性別={gender}, 状況={status}\n"
+            "心理的洞察を交え、相手を安心させる言葉で5〜6文で返信してください。"
         )
+    else:
+        system_prompt = (
+            f"あなたは恋愛相談AI『カケル』です。\n"
+            f"ユーザー属性: 性別={gender}, 状況={status}\n"
+            "共感を中心に2〜3文で優しく返信してください。"
+        )
+
+    # 履歴（直近10）
+    history = []
+    try:
+        res = supabase.table("logs").select("message, type").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
+        for l in (res.data or [])[::-1]:
+            if l["type"] == "user":
+                history.append({"role": "user", "content": l["message"]})
+            elif l["type"] == "ai":
+                history.append({"role": "assistant", "content": l["message"]})
+    except Exception as e:
+        print(f"❌ 履歴取得エラー: {e}")
+
+    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_message}]
+    try:
+        res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.8)
         return res.choices[0].message.content.strip()
     except Exception as e:
         print(f"❌ OpenAI応答エラー: {e}")
@@ -207,7 +285,7 @@ def callback():
     body = request.get_json()
     events = body.get("events", [])
     for event in events:
-        if event["type"] == "message" and event["message"]["type"] == "text":
+        if event.get("type") == "message" and event["message"]["type"] == "text":
             user_id = event["source"]["userId"]
             user_message = event["message"]["text"].strip()
             print(f"📩 {user_id}: {user_message}")
@@ -215,14 +293,50 @@ def callback():
             user = get_user(user_id)
             if not user:
                 save_user_profile(user_id)
-                send_line_message(user_id, "はじめまして、カケルです。\nまず、性別を教えてください（男性／女性／その他）")
+                send_line_message(user_id, "はじめまして、カケルです🌸\nまず、性別を教えてね（男性／女性／その他）")
                 continue
 
+            # /menu でメニュー再表示
+            if user_message in ["/menu", "メニュー", "menu"]:
+                send_premium_menu(user_id, user.get("plan", "free"))
+                continue
+
+            # Premium誘導ワード
+            if user_message in ["プレミアム", "premium", "有料", "課金"]:
+                link = f"{STORES_BASE_URL}{user_id}"
+                send_line_message(user_id, f"💎プレミアム登録はこちらから✨\n{link}")
+                continue
+
+            # おみくじ（ボタン or 手打ち）
+            if user_message in ["/omikuji", "おみくじ"]:
+                fortunes = [
+                    "大吉✨最高の一日になりそう！",
+                    "中吉😊穏やかな幸せが訪れそう。",
+                    "小吉🍀小さな幸運を見逃さないでね。",
+                    "吉🌸努力が実る兆し。",
+                    "凶💦焦らずチャンスを待とう。"
+                ]
+                msg = f"🔮 今日の恋みくじ：{random.choice(fortunes)}"
+                send_line_message(user_id, msg)
+                log_message_to_supabase(user_id, msg, "omikuji")
+                continue
+
+            # Premium限定：日記起動（“今日の想い”/気持ちメモ）
+            if user_message in ["/diary", "今日の想い", "気持ちメモ"]:
+                if user.get("plan") == "premium":
+                    send_line_message(user_id, "🩵 今日の気持ちを教えて。どんなことでも大丈夫だよ。")
+                    # “diary_wait” フラグをlogsに記録（簡易）
+                    log_message_to_supabase(user_id, "__diary_wait__", "system")
+                else:
+                    send_premium_invite(user_id)
+                continue
+
+            # 初回プロファイル収集
             if not user.get("gender"):
                 g = normalize_gender(user_message)
                 if g:
                     save_user_profile(user_id, gender=g)
-                    send_line_message(user_id, "ありがとう😊 次に、今の恋の状況を教えてください（片思い／交際中／失恋／その他）")
+                    send_line_message(user_id, "ありがとう😊 次に、今の恋の状況を教えてね（片思い／交際中／失恋／その他）")
                 else:
                     send_line_message(user_id, "ごめん、もう一度だけ！性別を教えてね（男性／女性／その他）")
                 continue
@@ -231,21 +345,86 @@ def callback():
                 s = normalize_status(user_message)
                 if s:
                     save_user_profile(user_id, status=s)
-                    send_line_message(user_id, "なるほど…！\n最後に、今の気持ちをひとことで教えてください（例：寂しい・モヤモヤ・楽しいなど）")
+                    send_line_message(user_id, "なるほど…！\n最後に、今の気持ちをひとことで教えて（例：寂しい・モヤモヤ・楽しいなど）")
                 else:
                     send_line_message(user_id, "状況を教えてね（片思い／交際中／失恋／その他）")
                 continue
 
-            if not user.get("feeling") or user.get("feeling") in ["", None]:
+            if not user.get("feeling"):
                 save_user_profile(user_id, feeling=user_message[:120])
                 send_line_message(user_id, "ありがとう。あなたの気持ち、大切に受け取ったよ。これから一緒に考えていこう。")
                 continue
 
+            # 「日記入力待ち」かどうかを直近ログから判定
+            diary_wait = False
+            try:
+                r = supabase.table("logs").select("message, type").eq("user_id", user_id).order("created_at", desc=True).limit(3).execute()
+                for row in r.data or []:
+                    if row.get("type") == "system" and row.get("message") == "__diary_wait__":
+                        diary_wait = True
+                        break
+            except Exception as e:
+                print("diary_wait判定エラー:", e)
+
+            if diary_wait and user.get("plan") == "premium":
+                # “日記”として保存（別テーブル無くてもlogsでOK／必要ならdiaryテーブル化）
+                saved = f"📝『今日の想い』を記録したよ。\n— {user_message[:200]}"
+                log_message_to_supabase(user_id, f"[DIARY]{user_message[:1000]}", "diary")
+                send_line_message(user_id, "ありがとう、ちゃんと受け取ったよ🫶\n少しずつ気持ちを整えていこうね。")
+                log_message_to_supabase(user_id, saved, "ai")
+                # フラグを消す（新しいsystemログで上書き）
+                log_message_to_supabase(user_id, "__diary_end__", "system")
+                continue
+
+            # 通常返信
             reply = generate_ai_reply(user_id, user_message)
             send_line_message(user_id, reply)
+            # 先にユーザーログ
             log_message_to_supabase(user_id, user_message, "user")
+            # 次にAIログ
             log_message_to_supabase(user_id, reply, "ai")
+
+            # 会話5往復ごとにPremium案内（無料ユーザーのみ）
+            if get_conversation_count(user_id) % 5 == 0 and user.get("plan") != "premium":
+                send_premium_invite(user_id)
+
     return "OK"
+
+# ========================
+# STORES Webhook
+# ========================
+@app.route("/payment/webhook", methods=["POST"])
+def payment_webhook():
+    if not verify_signature(request):
+        abort(403)
+    try:
+        data = request.get_json()
+        event_type = data.get("event", "")
+        user_id = data.get("user_id") or (data.get("metadata") or {}).get("line_user_id")
+
+        if not user_id:
+            print("❌ user_idがWebhookに含まれていません")
+            return "NG", 400
+
+        if event_type in ["payment.success", "subscription.created"]:
+            save_user_profile(user_id, plan="premium")
+            send_line_message(user_id, "✨Premium登録ありがとう！\nこれからは、もっと深く寄り添っていくね💎")
+            log_message_to_supabase(user_id, "プレミアム登録完了", "system")
+            return "OK", 200
+
+        elif event_type in ["subscription.canceled", "payment.canceled"]:
+            save_user_profile(user_id, plan="free")
+            send_line_message(user_id, "💡Premiumを解除しました。また戻りたくなったら、いつでも待ってるね。")
+            log_message_to_supabase(user_id, "プレミアム解約", "system")
+            return "OK", 200
+
+        else:
+            print(f"🌀 未対応イベント: {event_type}")
+            return "Ignored", 200
+
+    except Exception as e:
+        print(f"❌ Webhook処理エラー: {e}")
+        return str(e), 500
 
 # ========================
 # 定期配信（月・水・金・日・おみくじ）
@@ -269,21 +448,30 @@ def wednesday():
 @app.route("/cron/friday")
 def friday():
     check_key()
-    msg = "🌙金曜メッセージ：1週間お疲れさま。今夜はゆっくり休もう。"
+    msg = "🌙金曜メッセージ：1週間お疲れさま。今夜は少し、自分の気持ちを労わってね。"
     broadcast_message(msg)
-    log_message_to_supabase("system", msg, "friday")
+    follow = "💭 今週のこと、少し整理してみない？\nPremiumなら『今日の想い』で想いを残せるよ💌"
+    broadcast_message(follow)
+    # 無料ユーザーへPremium誘導ボタン
+    try:
+        res = supabase.table("users").select("user_id, plan").eq("plan", "free").execute()
+        for u in res.data or []:
+            send_premium_invite(u["user_id"])
+    except Exception as e:
+        print("金曜誘導エラー:", e)
+    log_message_to_supabase("system", msg + "\n" + follow, "friday")
     return "✅ Friday broadcast sent"
 
 @app.route("/cron/sunday")
 def sunday():
     check_key()
-    msg = "☀️日曜メッセージ：今週もよく頑張りましたね。感謝してリセットしよう。"
+    msg = "☀️日曜メッセージ：今週もよく頑張りました。自分に優しく、心をリセットしよう。"
     broadcast_message(msg)
     log_message_to_supabase("system", msg, "sunday")
     return "✅ Sunday broadcast sent"
 
 @app.route("/cron/omikuji")
-def omikuji():
+def cron_omikuji():
     check_key()
     fortunes = [
         "大吉✨最高の一日になりそう！",
@@ -327,7 +515,7 @@ def weekly_report():
         summary = ai_summary.choices[0].message.content.strip()
         report += "\n🧠【AI分析】\n" + summary
 
-        send_line_message(ADMIN_ID, report[:490])  # ← 管理者専用
+        send_line_message(ADMIN_ID, report[:490])  # 管理者のみ
         log_message_to_supabase(ADMIN_ID, report, "weekly_report")
         return "✅ Weekly report sent"
     except Exception as e:
@@ -335,7 +523,59 @@ def weekly_report():
         return str(e)
 
 # ========================
-# Render スリープ防止
+# Premiumチェックイン（12時間無会話なら20時に送る）
+# ========================
+@app.route("/cron/premium_check_inactive")
+def premium_check_inactive():
+    """
+    Renderのスケジューラーで毎日 19:50(JST) 実行を推奨。
+    条件: Premiumユーザーかつ last_active <= now-12h を対象に、20時の”寄り添いメッセージ”を送信。
+    """
+    check_key()
+    try:
+        now = datetime.now(TZ)
+        threshold = now - timedelta(hours=12)
+
+        res = supabase.table("users").select("user_id, plan, last_active").eq("plan", "premium").execute()
+        users = res.data or []
+        target = []
+        for u in users:
+            la = u.get("last_active")
+            if not la:
+                target.append(u)
+                continue
+            try:
+                la_dt = datetime.fromisoformat(la)
+            except Exception:
+                # ISOでない場合はスキップせず送る
+                target.append(u)
+                continue
+            if la_dt <= threshold:
+                target.append(u)
+
+        # 20時に向けた優しいメッセージ
+        msg_pool = [
+            "🌙こんばんは、今日も一日お疲れさま。話したいこと、あったらいつでも聞かせてね。",
+            "💭最近どうしてるかな？気持ち、ひとりで抱え込まなくて大丈夫だよ。",
+            "🫶 無理しないでね。君のペースで大丈夫。いつでもここにいるよ。",
+            "🌸 今日は少しでも穏やかな時間が過ごせていますように。"
+        ]
+        msg = random.choice(msg_pool)
+
+        for u in target:
+            uid = u["user_id"]
+            send_line_message(uid, msg)
+            log_message_to_supabase(uid, msg, "check_in")
+            time.sleep(0.3)
+
+        print(f"✅ Premiumチェックイン送信: {len(target)}人")
+        return "✅ Premium check-in sent"
+    except Exception as e:
+        print(f"❌ Premiumチェック配信エラー: {e}")
+        return str(e)
+
+# ========================
+# Keep-alive
 # ========================
 def keep_alive():
     def ping():
@@ -349,7 +589,7 @@ def keep_alive():
     threading.Thread(target=ping, daemon=True).start()
 
 # ========================
-# ヘルスチェック
+# Health / Root
 # ========================
 @app.route("/health")
 def health():
@@ -357,10 +597,10 @@ def health():
 
 @app.route("/")
 def home():
-    return "🌸 Kakeru Bot running gently with memory & cron!"
+    return "🌸 Kakeru Premium Bot running gently with love & memory."
 
 # ========================
-# メイン実行
+# Main
 # ========================
 if __name__ == "__main__":
     keep_alive()
