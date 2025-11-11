@@ -316,7 +316,7 @@ def callback():
                     "吉🌸努力が実る兆し。",
                     "凶💦焦らずチャンスを待とう。"
                 ]
-                msg = f"🔮 今日の恋みくじ：{random.choice(fortunes)}"
+                msg = f"🔮 今日の運勢：{random.choice(fortunes)}"
                 send_line_message(user_id, msg)
                 log_message_to_supabase(user_id, msg, "omikuji")
                 continue
@@ -480,7 +480,7 @@ def cron_omikuji():
         "吉🌸努力が実る兆し。",
         "凶💦焦らずチャンスを待とう。"
     ]
-    msg = f"🔮 今日の恋みくじ：{random.choice(fortunes)}"
+    msg = f"🔮 今日の運勢：{random.choice(fortunes)}"
     broadcast_message(msg)
     log_message_to_supabase("system", msg, "omikuji")
     return "✅ Omikuji broadcast sent"
