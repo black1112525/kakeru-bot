@@ -124,6 +124,7 @@ def save_user_profile(uid, **fields):
         supabase.table("users").upsert(data, on_conflict="user_id").execute()
     except Exception as e:
         print("❌ user保存エラー:", e)
+
 # ========================
 # AI Reply
 # ========================
@@ -170,7 +171,7 @@ def send_premium_notice(user_id):
     """Premiumボタン → Premium準備中メッセージ"""
     msg = (
         "💎Premium は現在準備中です。\n"
-        "もう少しだけお待ちください。"
+        "もう少しお待ちください。"   # ★ここを変更
     )
     send_line_message(user_id, msg)
     log_message_to_supabase(user_id, msg, "system")
@@ -218,12 +219,13 @@ def callback():
             return "OK"
 
         # ▶ メニュー処理 ===================
-        if msg == "相談室":
-            send_soudanshitsu_start(user_id)
+        # Premium（テキストが premium / Premium / premium「準備中」 などでも反応）
+        if "premium" in msg.lower():
+            send_premium_notice(user_id)
             return "OK"
 
-        if msg == "Premium":
-            send_premium_notice(user_id)
+        if msg == "相談室":
+            send_soudanshitsu_start(user_id)
             return "OK"
 
         if msg == "問い合わせ":
@@ -263,6 +265,7 @@ def callback():
         log_message_to_supabase(user_id, reply, "ai")
 
     return "OK"
+
 # ========================
 # 定期配信（運勢・曜日メッセージ）
 # ========================
@@ -400,4 +403,3 @@ if __name__ == "__main__":
     keep_alive()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
