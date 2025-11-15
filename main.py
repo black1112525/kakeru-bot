@@ -99,6 +99,23 @@ def log_message_to_supabase(user_id, message, log_type="auto"):
         pass
 
 # ========================
+# Broadcast（一斉送信）
+# ========================
+def broadcast_message(text):
+    if not supabase:
+        print("Supabase missing")
+        return
+    try:
+        res = supabase.table("users").select("user_id").execute()
+        users = res.data
+        for u in users:
+            uid = u.get("user_id")
+            send_line_message(uid, text)
+        print(f"📣 Broadcast → {len(users)} users")
+    except Exception as e:
+        print("❌ Broadcast Error:", e)
+
+# ========================
 # Users
 # ========================
 def get_user(uid):
@@ -134,8 +151,10 @@ def generate_ai_reply(user_id, user_message):
     status = user.get("status", "不明")
 
     system_prompt = (
-        f"あなたは恋愛相談AI『カケル』です。\n"
-        f"ユーザー属性: 性別={gender}, 状況={status}\n"
+        f"あなたは恋愛相談AI『カケル』です。
+"
+        f"ユーザー属性: 性別={gender}, 状況={status}
+"
         "共感を中心に2〜3文で優しく返信してください。"
     )
 
@@ -152,15 +171,16 @@ def generate_ai_reply(user_id, user_message):
     except:
         return "少し考えごとしてたみたい、ごめんね。もう一度話してくれる？"
 
-
 # ========================
-# 相談室・Premium・問い合わせ メッセージ
+# 相談室・Premium・問い合わせ
 # ========================
 def send_soudanshitsu_start(user_id):
-    """相談室ボタン → AIに接続（通知なし）"""
     msg = (
-        "ご利用ありがとうございます。\n"
-        "ここからは『カケル相談室』としてお話を伺います。\n\n"
+        "ご利用ありがとうございます。
+"
+        "ここからは『カケル相談室』としてお話を伺います。
+
+"
         "お悩みや気になることを自由に送ってくださいね。"
     )
     send_line_message(user_id, msg)
@@ -168,28 +188,30 @@ def send_soudanshitsu_start(user_id):
 
 
 def send_premium_notice(user_id):
-    """Premiumボタン → Premium準備中メッセージ"""
     msg = (
-        "💎Premium は現在準備中です。\n"
-        "もう少しお待ちください。"   # ★ここを変更
+        "💎Premium は現在準備中です。
+"
+        "もう少しお待ちください。"
     )
     send_line_message(user_id, msg)
     log_message_to_supabase(user_id, msg, "system")
 
 
 def send_inquiry_message(user_id):
-    """問い合わせボタン → 管理者へ通知"""
     user = get_user(user_id)
-    notify = f"📩【問い合わせ】\nユーザーID: {user_id}\n性別: {user.get('gender')}\n状況: {user.get('status')}"
+    notify = f"📩【問い合わせ】
+ユーザーID: {user_id}
+性別: {user.get('gender')}
+状況: {user.get('status')}"
     send_line_message(ADMIN_ID, notify)
 
     msg = (
-        "お問い合わせありがとうございます。\n"
+        "お問い合わせありがとうございます。
+"
         "担当より順次ご連絡いたしますので、少しだけお待ちください。"
     )
     send_line_message(user_id, msg)
     log_message_to_supabase(user_id, "問い合わせ受理", "inquiry")
-
 
 # ========================
 # Webhook
@@ -207,19 +229,18 @@ def callback():
 
         user_id = event["source"]["userId"]
         msg = event["message"]["text"].strip()
-        user = get_user(user_id)
-
+        user = get_user(user
         # ▶ 初回登録
         if not user:
             save_user_profile(user_id)
             send_line_message(
                 user_id,
-                "はじめまして、カケルです。\nまず、性別を教えてね（男性／女性／その他）"
+                "はじめまして、カケルです。
+まず、性別を教えてね（男性／女性／その他）"
             )
             return "OK"
 
         # ▶ メニュー処理 ===================
-        # Premium（テキストが premium / Premium / premium「準備中」 などでも反応）
         if "premium" in msg.lower():
             send_premium_notice(user_id)
             return "OK"
@@ -283,14 +304,12 @@ def cron_omikuji():
     broadcast_message(msg)
     return "OK"
 
-
 @app.route("/cron/monday")
 def monday():
     check_key()
     msg = "🌅月曜日：新しい週の始まり。ゆっくりで大丈夫だよ。"
     broadcast_message(msg)
     return "OK"
-
 
 @app.route("/cron/wednesday")
 def wednesday():
@@ -299,14 +318,12 @@ def wednesday():
     broadcast_message(msg)
     return "OK"
 
-
 @app.route("/cron/friday")
 def friday():
     check_key()
     msg = "🌙金曜日：一週間お疲れ様。週末は心を休めてね。"
     broadcast_message(msg)
     return "OK"
-
 
 @app.route("/cron/sunday")
 def sunday():
@@ -315,12 +332,10 @@ def sunday():
     broadcast_message(msg)
     return "OK"
 
-
 # ========================
 # X（旧Twitter） 自動投稿
 # ========================
 def generate_ai_post(time_type):
-    """朝/夜用の短文メッセージ生成"""
     if time_type == "morning":
         base = "今日もゆっくり、自分のペースで進んでいこうね。"
     else:
@@ -338,7 +353,6 @@ def generate_ai_post(time_type):
         return res.choices[0].message.content.strip()
     except:
         return None
-
 
 @app.route("/cron/post_tweet")
 def post_tweet():
@@ -360,14 +374,16 @@ def post_tweet():
     if not text:
         return "Gen error", 500
 
-    final = f"{icon} {text}\n\n登録はこちら👇\n{LINE_LINK}"
+    final = f"{icon} {text}
+
+登録はこちら👇
+{LINE_LINK}"
     try:
         r = twitter.create_tweet(text=final)
         return jsonify({"status": "ok", "tweet_id": r.data["id"]})
     except Exception as e:
         print("Tweet error:", e)
         return "Error", 500
-
 
 # ========================
 # Keep Alive
@@ -382,7 +398,6 @@ def keep_alive():
             time.sleep(600)
     threading.Thread(target=loop, daemon=True).start()
 
-
 # ========================
 # health
 # ========================
@@ -390,11 +405,9 @@ def keep_alive():
 def health():
     return "OK", 200
 
-
 @app.route("/")
 def home():
     return "🌸 Kakeru Bot running"
-
 
 # ========================
 # Main
@@ -403,3 +416,4 @@ if __name__ == "__main__":
     keep_alive()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
