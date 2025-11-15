@@ -50,17 +50,19 @@ except Exception as e:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+
 def get_twitter_client():
     try:
         return tweepy.Client(
             consumer_key=TWITTER_API_KEY,
             consumer_secret=TWITTER_API_SECRET,
             access_token=TWITTER_ACCESS_TOKEN,
-            access_token_secret=TWITTER_ACCESS_SECRET
+            access_token_secret=TWITTER_ACCESS_SECRET,
         )
     except Exception as e:
         print("❌ Xクライアント初期化失敗:", e)
         return None
+
 
 # ========================
 # Utils
@@ -68,35 +70,47 @@ def get_twitter_client():
 def now_iso():
     return datetime.now(TZ).isoformat()
 
+
 def check_key():
     if request.args.get("key") != CRON_KEY:
         abort(403)
 
+
 def send_line_message(user_id, text):
-    headers = {"Content-Type": "application/json",
-               "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    data = {"to": user_id,
-            "messages": [{"type": "text", "text": text[:490]}]}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+    }
+    data = {
+        "to": user_id,
+        "messages": [{"type": "text", "text": text[:490]}],
+    }
     try:
         r = requests.post(
-            "https://api.line.me/v2/bot/message/push", headers=headers, json=data
+            "https://api.line.me/v2/bot/message/push",
+            headers=headers,
+            json=data,
         )
         print(f"📤 送信({user_id}) → {r.status_code}")
     except Exception as e:
         print("❌ 送信エラー:", e)
 
+
 def log_message_to_supabase(user_id, message, log_type="auto"):
     if not supabase:
         return
     try:
-        supabase.table("logs").insert({
-            "user_id": user_id,
-            "message": message,
-            "type": log_type,
-            "created_at": now_iso()
-        }).execute()
-    except:
+        supabase.table("logs").insert(
+            {
+                "user_id": user_id,
+                "message": message,
+                "type": log_type,
+                "created_at": now_iso(),
+            }
+        ).execute()
+    except Exception:
         pass
+
 
 # ========================
 # Broadcast（一斉送信）
@@ -107,13 +121,15 @@ def broadcast_message(text):
         return
     try:
         res = supabase.table("users").select("user_id").execute()
-        users = res.data
+        users = res.data or []
         for u in users:
             uid = u.get("user_id")
-            send_line_message(uid, text)
+            if uid:
+                send_line_message(uid, text)
         print(f"📣 Broadcast → {len(users)} users")
     except Exception as e:
         print("❌ Broadcast Error:", e)
+
 
 # ========================
 # Users
@@ -122,10 +138,17 @@ def get_user(uid):
     if not supabase:
         return None
     try:
-        r = supabase.table("users").select("*").eq("user_id", uid).limit(1).execute()
+        r = (
+            supabase.table("users")
+            .select("*")
+            .eq("user_id", uid)
+            .limit(1)
+            .execute()
+        )
         return r.data[0] if r.data else None
-    except:
+    except Exception:
         return None
+
 
 def save_user_profile(uid, **fields):
     if not supabase:
@@ -138,9 +161,12 @@ def save_user_profile(uid, **fields):
         if not existing.get("created_at"):
             data["created_at"] = now_iso()
             data["last_active"] = now_iso()
-        supabase.table("users").upsert(data, on_conflict="user_id").execute()
+        supabase.table("users").upsert(
+            data, on_conflict="user_id"
+        ).execute()
     except Exception as e:
         print("❌ user保存エラー:", e)
+
 
 # ========================
 # AI Reply
@@ -151,35 +177,32 @@ def generate_ai_reply(user_id, user_message):
     status = user.get("status", "不明")
 
     system_prompt = (
-    "あなたは恋愛相談AI『カケル』です。\n"
-    f"ユーザー属性: 性別={gender}, 状況={status}\n"
-    "共感を中心に2〜3文で優しく返信してください。"
-)
-
+        "あなたは恋愛相談AI『カケル』です。\n"
+        f"ユーザー属性: 性別={gender}, 状況={status}\n"
+        "共感を中心に2〜3文で優しく返信してください。"
+    )
 
     try:
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
+                {"role": "user", "content": user_message},
             ],
-            temperature=0.7
+            temperature=0.7,
         )
         return res.choices[0].message.content.strip()
-    except:
+    except Exception:
         return "少し考えごとしてたみたい、ごめんね。もう一度話してくれる？"
+
 
 # ========================
 # 相談室・Premium・問い合わせ
 # ========================
 def send_soudanshitsu_start(user_id):
     msg = (
-        "ご利用ありがとうございます。
-"
-        "ここからは『カケル相談室』としてお話を伺います。
-
-"
+        "ご利用ありがとうございます。\n"
+        "ここからは『カケル相談室』としてお話を伺います。\n\n"
         "お悩みや気になることを自由に送ってくださいね。"
     )
     send_line_message(user_id, msg)
@@ -188,8 +211,7 @@ def send_soudanshitsu_start(user_id):
 
 def send_premium_notice(user_id):
     msg = (
-        "💎Premium は現在準備中です。
-"
+        "💎Premium は現在準備中です。\n"
         "もう少しお待ちください。"
     )
     send_line_message(user_id, msg)
@@ -197,20 +219,22 @@ def send_premium_notice(user_id):
 
 
 def send_inquiry_message(user_id):
-    user = get_user(user_id)
-    notify = f"📩【問い合わせ】
-ユーザーID: {user_id}
-性別: {user.get('gender')}
-状況: {user.get('status')}"
+    user = get_user(user_id) or {}
+    notify = (
+        "📩【問い合わせ】\n"
+        f"ユーザーID: {user_id}\n"
+        f"性別: {user.get('gender')}\n"
+        f"状況: {user.get('status')}"
+    )
     send_line_message(ADMIN_ID, notify)
 
     msg = (
-        "お問い合わせありがとうございます。
-"
+        "お問い合わせありがとうございます。\n"
         "担当より順次ご連絡いたしますので、少しだけお待ちください。"
     )
     send_line_message(user_id, msg)
     log_message_to_supabase(user_id, "問い合わせ受理", "inquiry")
+
 
 # ========================
 # Webhook
@@ -228,14 +252,14 @@ def callback():
 
         user_id = event["source"]["userId"]
         msg = event["message"]["text"].strip()
-        user = get_user(user
+        user = get_user(user_id)
+
         # ▶ 初回登録
         if not user:
             save_user_profile(user_id)
             send_line_message(
                 user_id,
-                "はじめまして、カケルです。
-まず、性別を教えてね（男性／女性／その他）"
+                "はじめまして、カケルです。\nまず、性別を教えてね（男性／女性／その他）",
             )
             return "OK"
 
@@ -255,19 +279,29 @@ def callback():
 
         # ▶ 性別登録
         if not user.get("gender"):
-            if "男" in msg: gender = "男性"
-            elif "女" in msg: gender = "女性"
-            else: gender = "その他"
+            if "男" in msg:
+                gender = "男性"
+            elif "女" in msg:
+                gender = "女性"
+            else:
+                gender = "その他"
             save_user_profile(user_id, gender=gender)
-            send_line_message(user_id, "今の恋の状況を教えてね（片思い／交際中／失恋）")
+            send_line_message(
+                user_id,
+                "今の恋の状況を教えてね（片思い／交際中／失恋）",
+            )
             return "OK"
 
         # ▶ 状況登録
         if not user.get("status"):
-            if "片" in msg: s = "片思い"
-            elif "交" in msg: s = "交際中"
-            elif "失" in msg: s = "失恋"
-            else: s = "その他"
+            if "片" in msg:
+                s = "片思い"
+            elif "交" in msg:
+                s = "交際中"
+            elif "失" in msg:
+                s = "失恋"
+            else:
+                s = "その他"
             save_user_profile(user_id, status=s)
             send_line_message(user_id, "今の気持ちをひとことで教えてね。")
             return "OK"
@@ -275,7 +309,10 @@ def callback():
         # ▶ 最後のプロフィール項目
         if not user.get("feeling"):
             save_user_profile(user_id, feeling=msg)
-            send_line_message(user_id, "ありがとう、気持ち大切に受け取ったよ。")
+            send_line_message(
+                user_id,
+                "ありがとう、気持ち大切に受け取ったよ。",
+            )
             return "OK"
 
         # ▶ 相談AI返信
@@ -285,6 +322,7 @@ def callback():
         log_message_to_supabase(user_id, reply, "ai")
 
     return "OK"
+
 
 # ========================
 # 定期配信（運勢・曜日メッセージ）
@@ -303,12 +341,14 @@ def cron_omikuji():
     broadcast_message(msg)
     return "OK"
 
+
 @app.route("/cron/monday")
 def monday():
     check_key()
     msg = "🌅月曜日：新しい週の始まり。ゆっくりで大丈夫だよ。"
     broadcast_message(msg)
     return "OK"
+
 
 @app.route("/cron/wednesday")
 def wednesday():
@@ -317,6 +357,7 @@ def wednesday():
     broadcast_message(msg)
     return "OK"
 
+
 @app.route("/cron/friday")
 def friday():
     check_key()
@@ -324,12 +365,14 @@ def friday():
     broadcast_message(msg)
     return "OK"
 
+
 @app.route("/cron/sunday")
 def sunday():
     check_key()
     msg = "☀️日曜日：今週も頑張ったね。自分を労わろう。"
     broadcast_message(msg)
     return "OK"
+
 
 # ========================
 # X（旧Twitter） 自動投稿
@@ -347,11 +390,12 @@ def generate_ai_post(time_type):
             model="gpt-4o-mini",
             messages=[{"role": "system", "content": prompt}],
             temperature=0.7,
-            max_tokens=120
+            max_tokens=120,
         )
         return res.choices[0].message.content.strip()
-    except:
+    except Exception:
         return None
+
 
 @app.route("/cron/post_tweet")
 def post_tweet():
@@ -373,16 +417,18 @@ def post_tweet():
     if not text:
         return "Gen error", 500
 
-    final = f"{icon} {text}
-
-登録はこちら👇
-{LINE_LINK}"
+    final = (
+        f"{icon} {text}\n\n"
+        f"登録はこちら👇\n"
+        f"{LINE_LINK}"
+    )
     try:
         r = twitter.create_tweet(text=final)
         return jsonify({"status": "ok", "tweet_id": r.data["id"]})
     except Exception as e:
         print("Tweet error:", e)
         return "Error", 500
+
 
 # ========================
 # Keep Alive
@@ -392,10 +438,12 @@ def keep_alive():
         while True:
             try:
                 requests.get("https://kakeru-bot-1.onrender.com/")
-            except:
+            except Exception:
                 pass
             time.sleep(600)
+
     threading.Thread(target=loop, daemon=True).start()
+
 
 # ========================
 # health
@@ -404,9 +452,11 @@ def keep_alive():
 def health():
     return "OK", 200
 
+
 @app.route("/")
 def home():
     return "🌸 Kakeru Bot running"
+
 
 # ========================
 # Main
@@ -415,4 +465,3 @@ if __name__ == "__main__":
     keep_alive()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
