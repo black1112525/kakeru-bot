@@ -151,12 +151,11 @@ def generate_ai_reply(user_id, user_message):
     status = user.get("status", "不明")
 
     system_prompt = (
-        f"あなたは恋愛相談AI『カケル』です。
-"
-        f"ユーザー属性: 性別={gender}, 状況={status}
-"
-        "共感を中心に2〜3文で優しく返信してください。"
-    )
+    "あなたは恋愛相談AI『カケル』です。\n"
+    f"ユーザー属性: 性別={gender}, 状況={status}\n"
+    "共感を中心に2〜3文で優しく返信してください。"
+)
+
 
     try:
         res = client.chat.completions.create(
